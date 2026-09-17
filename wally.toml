@@ -1,0 +1,9 @@
+[package]
+name = "placeholder/waffles"
+description = "High-performance, safe binary serialization for Roblox"
+version = "1.0.0"
+license = "MIT"
+realm = "shared"
+registry = "https://github.com/UpliftGames/wally-index"
+
+[dependencies]

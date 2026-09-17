@@ -1,0 +1,2342 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="ModuleScript" referent="1">
+      <Properties>
+        <string name="Name">Waffles</string>
+        <string name="Source"><![CDATA[--!strict
+
+local DefaultSettings = require(script.Settings)
+local WriterModule = require(script.Internal.Writer)
+local ReaderModule = require(script.Internal.Reader)
+local AutoCodec = require(script.Internal.AutoCodec)
+local SchemaModule = require(script.Internal.Schema)
+local BufferUtil = require(script.Internal.BufferUtil)
+
+local MAGIC = 0x5746
+local WIRE_VERSION = 1
+local KIND_AUTO = 0
+local KIND_BATCH = 1
+local KIND_SCHEMA = 2
+
+export type Configuration = {
+	poolingEnabled: boolean?,
+	writerPoolMaxPerBucket: number?,
+	maxPooledWriterSize: number?,
+	readerPoolMax: number?,
+	initialWriterSize: number?,
+	rleThreshold: number?,
+	sortedKeysCacheEnabled: boolean?,
+	sortedKeysCacheTrustMode: boolean?,
+	commonKeys: {string}?,
+	stringCacheMinLength: number?,
+	schemaValidationEnabled: boolean?,
+	strictBoundsChecking: boolean?,
+	maxDepth: number?,
+	maxCollectionCount: number?,
+	maxStringBytes: number?,
+	maxBufferBytes: number?,
+	maxPayloadBytes: number?,
+	maxVarintBytes: number?,
+	debugAsserts: boolean?,
+}
+
+export type ConverterWriter = {
+	WriteU8: (self: ConverterWriter, value: number) -> (),
+	WriteU16: (self: ConverterWriter, value: number) -> (),
+	WriteU32: (self: ConverterWriter, value: number) -> (),
+	WriteI16: (self: ConverterWriter, value: number) -> (),
+	WriteI32: (self: ConverterWriter, value: number) -> (),
+	WriteF32: (self: ConverterWriter, value: number) -> (),
+	WriteF64: (self: ConverterWriter, value: number) -> (),
+	WriteVarUInt: (self: ConverterWriter, value: number) -> (),
+	WriteVarInt: (self: ConverterWriter, value: number) -> (),
+	WriteString: (self: ConverterWriter, value: string) -> (),
+	WriteRawString: (self: ConverterWriter, value: string) -> (),
+	WriteBuffer: (self: ConverterWriter, value: buffer) -> (),
+	WriteRawBuffer: (self: ConverterWriter, value: buffer) -> (),
+	Position: (self: ConverterWriter) -> number,
+}
+
+export type ConverterReader = {
+	ReadU8: (self: ConverterReader, context: string?) -> number,
+	ReadU16: (self: ConverterReader, context: string?) -> number,
+	ReadU32: (self: ConverterReader, context: string?) -> number,
+	ReadI16: (self: ConverterReader, context: string?) -> number,
+	ReadI32: (self: ConverterReader, context: string?) -> number,
+	ReadF32: (self: ConverterReader, context: string?) -> number,
+	ReadF64: (self: ConverterReader, context: string?) -> number,
+	ReadVarUInt: (self: ConverterReader, context: string?) -> number,
+	ReadVarInt: (self: ConverterReader, context: string?) -> number,
+	ReadString: (self: ConverterReader, maxLength: number, context: string?) -> string,
+	ReadRawString: (self: ConverterReader, length: number, context: string?) -> string,
+	ReadBuffer: (self: ConverterReader, maxLength: number, context: string?) -> buffer,
+	ReadRawBuffer: (self: ConverterReader, length: number, context: string?) -> buffer,
+	Remaining: (self: ConverterReader) -> number,
+	Position: (self: ConverterReader) -> number,
+}
+
+export type Converter = {
+	Id: number?,
+	CanSerialize: (value: any) -> boolean,
+	Serialize: (writer: ConverterWriter, value: any) -> (),
+	Deserialize: (reader: ConverterReader) -> any,
+}
+
+export type Batch = {any} & {n: number}
+
+export type Schema = {
+	Serialize: (self: Schema, value: any) -> buffer,
+	Deserialize: (self: Schema, data: buffer) -> any,
+	Validate: (self: Schema, value: any) -> (boolean, string?),
+	Definition: any,
+	Hash: number,
+}
+
+local config: {[string]: any} = {}
+for key, value in DefaultSettings do
+	config[key] = if type(value) == "table" then table.clone(value) else value
+end
+
+local commonKeyIds: {[string]: number} = {}
+local commonFingerprint = 0
+local converters: {any} = {}
+local convertersById: {[number]: any} = {}
+local converterNames: {[string]: boolean} = {}
+
+local function stableHash(text: string): number
+	local hash = 5381
+	for index = 1, #text do
+		hash = (hash * 33 + string.byte(text, index)) % 4294967296
+	end
+	return hash
+end
+
+local function rebuildCommonKeys()
+	table.clear(commonKeyIds)
+	local parts = table.create(#config.commonKeys)
+	for index, key in config.commonKeys do
+		if commonKeyIds[key] then
+			error("[Waffles] commonKeys cannot contain duplicates", 3)
+		end
+		commonKeyIds[key] = index
+		parts[index] = tostring(#key) .. ":" .. key
+	end
+	-- Both fields change how string references are assigned and therefore must
+	-- match on the encoder and decoder.
+	commonFingerprint = stableHash(tostring(config.stringCacheMinLength) .. "#" .. table.concat(parts, "|"))
+end
+
+rebuildCommonKeys()
+
+local function cleanError(message: any, operation: string): string
+	local text = tostring(message)
+	local waffles = string.match(text, "(%[Waffles%].*)")
+	if waffles then
+		return waffles
+	end
+	return "[Waffles] " .. operation .. " failed: " .. text
+end
+
+local function writeHeader(writer: any, kind: number)
+	writer:WriteU16(MAGIC)
+	writer:WriteU8(WIRE_VERSION)
+	writer:WriteU8(kind)
+	writer:WriteU32(commonFingerprint)
+end
+
+local function readHeader(reader: any, expectedKind: number)
+	if reader:ReadU16("Waffles header") ~= MAGIC then
+		error("[Waffles] Invalid buffer header", 3)
+	end
+	local version = reader:ReadU8("wire-format version")
+	if version ~= WIRE_VERSION then
+		error(string.format("[Waffles] Unsupported wire-format version: %d", version), 3)
+	end
+	local kind = reader:ReadU8("payload kind")
+	if kind ~= expectedKind then
+		error(string.format("[Waffles] Unexpected payload kind: %d", kind), 3)
+	end
+	local fingerprint = reader:ReadU32("common-key fingerprint")
+	if fingerprint ~= commonFingerprint then
+		error("[Waffles] String-reference configuration does not match the payload", 3)
+	end
+end
+
+local function acquireWriter(): any
+	return WriterModule.acquire(config.initialWriterSize, config.poolingEnabled, config.maxPayloadBytes)
+end
+
+local function finishWriter(writer: any): buffer
+	if config.debugAsserts and writer:Position() > buffer.len(writer._data) then
+		error("[Waffles] Internal writer cursor invariant failed", 3)
+	end
+	local result = writer:Finish()
+	if buffer.len(result) > config.maxPayloadBytes then
+		error(string.format("[Waffles] Encoded payload size %d exceeds limit %d", buffer.len(result), config.maxPayloadBytes), 3)
+	end
+	return result
+end
+
+local function acquireReader(data: buffer): any
+	if typeof(data) ~= "buffer" then
+		error("[Waffles] Deserialization input must be a buffer", 3)
+	end
+	local length = buffer.len(data)
+	if length > config.maxPayloadBytes then
+		error(string.format("[Waffles] Payload size %d exceeds limit %d", length, config.maxPayloadBytes), 3)
+	end
+	return ReaderModule.acquire(data, config.maxVarintBytes, config.poolingEnabled)
+end
+
+local function releaseReader(reader: any)
+	ReaderModule.release(reader, config.poolingEnabled, config.readerPoolMax)
+end
+
+local Waffles = {}
+
+function Waffles.SerializeAuto(value: any): buffer
+	local writer = acquireWriter()
+	local ok, result = pcall(function()
+		writeHeader(writer, KIND_AUTO)
+		local context = AutoCodec.newEncodeContext(config, commonKeyIds, converters)
+		AutoCodec.writeValue(writer, value, context, 0)
+		return finishWriter(writer)
+	end)
+	WriterModule.release(writer, config.poolingEnabled, config.writerPoolMaxPerBucket, config.maxPooledWriterSize)
+	if not ok then
+		error(cleanError(result, "Serialization"), 2)
+	end
+	return result :: buffer
+end
+
+function Waffles.DeserializeAuto(data: buffer): any
+	local reader = acquireReader(data)
+	local ok, result = pcall(function()
+		readHeader(reader, KIND_AUTO)
+		local context = AutoCodec.newDecodeContext(config, config.commonKeys, convertersById)
+		local value = AutoCodec.readValue(reader, context, 0)
+		if config.strictBoundsChecking and reader:Remaining() ~= 0 then
+			error(string.format("[Waffles] Trailing data after automatic value: %d bytes", reader:Remaining()), 2)
+		end
+		return value
+	end)
+	releaseReader(reader)
+	if not ok then
+		error(cleanError(result, "Deserialization"), 2)
+	end
+	return result
+end
+
+function Waffles.SerializeBatch(values: {any}): buffer
+	if type(values) ~= "table" then
+		error("[Waffles] SerializeBatch expects an array or table.pack result", 2)
+	end
+	local count = if type((values :: any).n) == "number" then (values :: any).n else #values
+	if count < 0 or count % 1 ~= 0 or count > config.maxCollectionCount then
+		error("[Waffles] Invalid batch count", 2)
+	end
+	local writer = acquireWriter()
+	local ok, result = pcall(function()
+		writeHeader(writer, KIND_BATCH)
+		writer:WriteVarUInt(count)
+		local context = AutoCodec.newEncodeContext(config, commonKeyIds, converters)
+		for index = 1, count do
+			AutoCodec.writeValue(writer, values[index], context, 0)
+		end
+		return finishWriter(writer)
+	end)
+	WriterModule.release(writer, config.poolingEnabled, config.writerPoolMaxPerBucket, config.maxPooledWriterSize)
+	if not ok then
+		error(cleanError(result, "Batch serialization"), 2)
+	end
+	return result :: buffer
+end
+
+function Waffles.DeserializeBatch(data: buffer): Batch
+	local reader = acquireReader(data)
+	local ok, result = pcall(function()
+		readHeader(reader, KIND_BATCH)
+		local count = reader:ReadVarUInt("batch count")
+		if count > config.maxCollectionCount or count > reader:Remaining() then
+			error("[Waffles] Invalid or excessive batch count", 2)
+		end
+		local values = table.create(count)
+		local context = AutoCodec.newDecodeContext(config, config.commonKeys, convertersById)
+		for index = 1, count do
+			values[index] = AutoCodec.readValue(reader, context, 0)
+		end
+		(values :: any).n = count
+		if config.strictBoundsChecking and reader:Remaining() ~= 0 then
+			error(string.format("[Waffles] Trailing data after batch: %d bytes", reader:Remaining()), 2)
+		end
+		return values
+	end)
+	releaseReader(reader)
+	if not ok then
+		error(cleanError(result, "Batch deserialization"), 2)
+	end
+	return result :: Batch
+end
+
+local booleanSettings = {
+	poolingEnabled = true,
+	sortedKeysCacheEnabled = true,
+	sortedKeysCacheTrustMode = true,
+	schemaValidationEnabled = true,
+	strictBoundsChecking = true,
+	debugAsserts = true,
+}
+
+local integerRanges = {
+	writerPoolMaxPerBucket = {0, 128},
+	maxPooledWriterSize = {64, 16 * 1024 * 1024},
+	readerPoolMax = {0, 512},
+	initialWriterSize = {64, 16 * 1024 * 1024},
+	stringCacheMinLength = {0, 1024 * 1024},
+	maxDepth = {1, 512},
+	maxCollectionCount = {1, 10000000},
+	maxStringBytes = {0, 128 * 1024 * 1024},
+	maxBufferBytes = {0, 128 * 1024 * 1024},
+	maxPayloadBytes = {8, 256 * 1024 * 1024},
+	maxVarintBytes = {1, 8},
+}
+
+function Waffles.Configure(options: Configuration)
+	if type(options) ~= "table" then
+		error("[Waffles] Configure expects a table", 2)
+	end
+	local updates: {[string]: any} = {}
+	for key, value in (options :: any) do
+		if config[key] == nil then
+			error("[Waffles] Unknown configuration option: " .. tostring(key), 2)
+		elseif booleanSettings[key] then
+			if type(value) ~= "boolean" then error("[Waffles] Configuration option " .. key .. " must be boolean", 2) end
+			updates[key] = value
+		elseif integerRanges[key] then
+			local range = integerRanges[key]
+			if type(value) ~= "number" or value % 1 ~= 0 or value < range[1] or value > range[2] then
+				error(string.format("[Waffles] Configuration option %s must be an integer from %d to %d", key, range[1], range[2]), 2)
+			end
+			updates[key] = value
+		elseif key == "rleThreshold" then
+			if type(value) ~= "number" or value ~= value or value < 0 or value >= 1 then error("[Waffles] rleThreshold must be in the range [0, 1)", 2) end
+			updates[key] = value
+		elseif key == "commonKeys" then
+			if type(value) ~= "table" then error("[Waffles] commonKeys must be an array of strings", 2) end
+			local copied = {}
+			local seen = {}
+			local count = 0
+			local maximum = 0
+			for index, item in value do
+				if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or type(item) ~= "string" then error("[Waffles] commonKeys must be a contiguous array of strings", 2) end
+				if seen[item] then error("[Waffles] commonKeys cannot contain duplicates", 2) end
+				seen[item] = true
+				count += 1
+				maximum = math.max(maximum, index)
+				copied[index] = item
+			end
+			if maximum ~= count then error("[Waffles] commonKeys must be a contiguous array of strings", 2) end
+			updates[key] = copied
+		end
+	end
+	for key, value in updates do config[key] = value end
+	if updates.commonKeys or updates.stringCacheMinLength then rebuildCommonKeys() end
+end
+
+function Waffles.GetConfiguration(): {[string]: any}
+	local copy = table.clone(config)
+	copy.commonKeys = table.clone(config.commonKeys)
+	return copy
+end
+
+function Waffles.RegisterConverter(name: string, converter: Converter): number
+	if type(name) ~= "string" or name == "" then error("[Waffles] Converter name must be a non-empty string", 2) end
+	if converterNames[name] then error("[Waffles] Converter is already registered: " .. name, 2) end
+	if type(converter) ~= "table" or type(converter.CanSerialize) ~= "function" or type(converter.Serialize) ~= "function" or type(converter.Deserialize) ~= "function" then
+		error("[Waffles] Converter must provide CanSerialize, Serialize, and Deserialize functions", 2)
+	end
+	local id = converter.Id or stableHash(name)
+	if type(id) ~= "number" or id % 1 ~= 0 or id < 1 or id > 4294967295 then
+		error("[Waffles] Converter Id must be an integer from 1 to 4294967295", 2)
+	end
+	if convertersById[id] then error(string.format("[Waffles] Converter identifier collision: %d", id), 2) end
+	local registered = {
+		Id = id,
+		Name = name,
+		CanSerialize = converter.CanSerialize,
+		Serialize = converter.Serialize,
+		Deserialize = converter.Deserialize,
+	}
+	table.insert(converters, registered)
+	convertersById[id] = registered
+	converterNames[name] = true
+	return id
+end
+
+function Waffles.Schema(definitionOrFields: any): Schema
+	return SchemaModule.create(definitionOrFields)
+end
+
+function Waffles.SmartSchema(exampleValue: any): Schema
+	return SchemaModule.smart(exampleValue)
+end
+
+local function serializeSchema(schema: any, value: any): buffer
+	if config.schemaValidationEnabled then
+		local valid, message = schema:Validate(value)
+		if not valid then error(message, 3) end
+	end
+	local writer = acquireWriter()
+	local ok, result = pcall(function()
+		writeHeader(writer, KIND_SCHEMA)
+		writer:WriteU32(schema.Hash)
+		local context = AutoCodec.newEncodeContext(config, commonKeyIds, converters)
+		SchemaModule.writeDefinition(schema.Definition, writer, value, context)
+		return finishWriter(writer)
+	end)
+	WriterModule.release(writer, config.poolingEnabled, config.writerPoolMaxPerBucket, config.maxPooledWriterSize)
+	if not ok then
+		error(cleanError(result, "Schema serialization"), 3)
+	end
+	return result
+end
+
+local function deserializeSchema(schema: any, data: buffer): any
+	local reader = acquireReader(data)
+	local ok, result = pcall(function()
+		readHeader(reader, KIND_SCHEMA)
+		local hash = reader:ReadU32("schema fingerprint")
+		if hash ~= schema.Hash then error("[Waffles] Schema does not match the encoded payload", 2) end
+		local context = AutoCodec.newDecodeContext(config, config.commonKeys, convertersById)
+		local value = SchemaModule.readDefinition(schema.Definition, reader, context)
+		if config.strictBoundsChecking and reader:Remaining() ~= 0 then error("[Waffles] Trailing data after schema value", 2) end
+		return value
+	end)
+	releaseReader(reader)
+	if not ok then error(cleanError(result, "Schema deserialization"), 3) end
+	return result
+end
+
+SchemaModule.setRuntime({
+	serialize = serializeSchema,
+	deserialize = deserializeSchema,
+	writeAny = AutoCodec.writeValue,
+	readAny = AutoCodec.readValue,
+})
+
+Waffles.Types = SchemaModule.Types
+Waffles.Buffer = BufferUtil
+Waffles.Version = "1.0.0"
+Waffles.WireVersion = WIRE_VERSION
+
+return table.freeze(Waffles)
+]]></string>
+      </Properties>
+      <Item class="Folder" referent="2">
+        <Properties>
+          <string name="Name">Internal</string>
+        </Properties>
+        <Item class="ModuleScript" referent="3">
+          <Properties>
+            <string name="Name">AutoCodec</string>
+            <string name="Source"><![CDATA[--!strict
+
+local Tags = require(script.Parent.Tags)
+
+type Writer = any
+type Reader = any
+type Config = {[string]: any}
+type Converter = {
+	Id: number,
+	Name: string,
+	CanSerialize: (value: any) -> boolean,
+	Serialize: (writer: Writer, value: any) -> (),
+	Deserialize: (reader: Reader) -> any,
+}
+
+type EncodeContext = {
+	config: Config,
+	strings: {[string]: number},
+	stringCount: number,
+	layouts: {[string]: number},
+	layoutCount: number,
+	active: {[any]: boolean},
+	commonKeyIds: {[string]: number},
+	converters: {Converter},
+}
+
+type DecodeContext = {
+	config: Config,
+	strings: {string},
+	layouts: {{string}},
+	commonKeys: {string},
+	convertersById: {[number]: Converter},
+}
+
+local AutoCodec = {}
+local floatScratch = buffer.create(4)
+
+local function checkDepth(config: Config, depth: number)
+	if depth > config.maxDepth then
+		error(string.format("[Waffles] Maximum nesting depth of %d exceeded", config.maxDepth), 3)
+	end
+end
+
+local function writeCachedString(writer: Writer, value: string, context: EncodeContext, isKey: boolean)
+	if isKey then
+		local commonId = context.commonKeyIds[value]
+		if commonId then
+			writer:WriteU8(Tags.CommonKey)
+			writer:WriteVarUInt(commonId)
+			return
+		end
+	end
+
+	local reference = context.strings[value]
+	if reference then
+		writer:WriteU8(Tags.StringReference)
+		writer:WriteVarUInt(reference)
+		return
+	end
+
+	writer:WriteU8(Tags.String)
+	writer:WriteString(value)
+	if #value >= context.config.stringCacheMinLength then
+		context.stringCount += 1
+		context.strings[value] = context.stringCount
+	end
+end
+
+local function readCachedString(reader: Reader, context: DecodeContext, tag: number): string
+	if tag == Tags.String then
+		local value = reader:ReadString(context.config.maxStringBytes, "string")
+		if #value >= context.config.stringCacheMinLength then
+			table.insert(context.strings, value)
+		end
+		return value
+	elseif tag == Tags.StringReference then
+		local id = reader:ReadVarUInt("string reference")
+		local value = context.strings[id]
+		if value == nil then
+			error(string.format("[Waffles] Invalid string reference: %d", id), 3)
+		end
+		return value
+	elseif tag == Tags.CommonKey then
+		local id = reader:ReadVarUInt("common-key reference")
+		local value = context.commonKeys[id]
+		if value == nil then
+			error(string.format("[Waffles] Invalid common-key reference: %d", id), 3)
+		end
+		return value
+	end
+	error(string.format("[Waffles] Invalid string tag: %d", tag), 3)
+end
+
+local function isArray(value: {[any]: any}): (boolean, number)
+	local count = 0
+	local maximum = 0
+	local array = true
+	for key in value do
+		count += 1
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then
+			array = false
+		elseif key > maximum then
+			maximum = key
+		end
+	end
+	return array and maximum == count, count
+end
+
+local function keyRank(value: any): number
+	local kind = type(value)
+	if kind == "boolean" then
+		return 1
+	elseif kind == "number" then
+		return 2
+	elseif kind == "string" then
+		return 3
+	end
+	return 99
+end
+
+local function compareKeys(a: any, b: any): boolean
+	local rankA = keyRank(a)
+	local rankB = keyRank(b)
+	if rankA ~= rankB then
+		return rankA < rankB
+	end
+	if rankA == 1 then
+		return a == false and b == true
+	elseif rankA == 2 or rankA == 3 then
+		return a < b
+	end
+	return false
+end
+
+local sortedKeyCache: {[any]: {keys: {any}, allStrings: boolean, count: number}} = setmetatable({}, {__mode = "k"}) :: any
+
+local function sortedKeys(value: {[any]: any}, count: number, config: Config): ({any}, boolean)
+	if config.sortedKeysCacheEnabled then
+		local cached = sortedKeyCache[value]
+		if cached and cached.count == count then
+			if config.sortedKeysCacheTrustMode then
+				return cached.keys, cached.allStrings
+			end
+			local valid = true
+			for _, key in cached.keys do
+				if value[key] == nil then valid = false; break end
+			end
+			if valid then return cached.keys, cached.allStrings end
+		end
+	end
+	local keys = table.create(count)
+	local allStrings = true
+	for key in value do
+		if keyRank(key) == 99 then
+			error("[Waffles] Dictionary keys must be booleans, numbers, or strings", 3)
+		end
+		if type(key) ~= "string" then
+			allStrings = false
+		elseif #key > config.maxStringBytes then
+			error(string.format("[Waffles] Dictionary key length %d exceeds limit %d", #key, config.maxStringBytes), 3)
+		end
+		table.insert(keys, key)
+	end
+	table.sort(keys, compareKeys)
+	if config.sortedKeysCacheEnabled then
+		sortedKeyCache[value] = {keys = keys, allStrings = allStrings, count = count}
+	end
+	return keys, allStrings
+end
+
+local function layoutSignature(keys: {any}, maximumBytes: number): string?
+	local pieces = table.create(#keys)
+	local totalBytes = 0
+	for index, key in keys do
+		local text = key :: string
+		if #text > maximumBytes then return nil end
+		local piece = tostring(#text) .. ":" .. text
+		totalBytes += #piece + 1
+		if totalBytes > maximumBytes then return nil end
+		pieces[index] = piece
+	end
+	return table.concat(pieces, "|")
+end
+
+local function varUIntSize(value: number): number
+	local size = 1
+	while value >= 128 do
+		value = math.floor(value / 128)
+		size += 1
+	end
+	return size
+end
+
+local function tryWriteRle(writer: Writer, value: buffer, threshold: number): boolean
+	local length = buffer.len(value)
+	if length < 8 then
+		return false
+	end
+	local runs = 0
+	local encodedBytes = 0
+	local cursor = 0
+	while cursor < length do
+		local byte = buffer.readu8(value, cursor)
+		local runLength = 1
+		while cursor + runLength < length and buffer.readu8(value, cursor + runLength) == byte do
+			runLength += 1
+		end
+		runs += 1
+		encodedBytes += varUIntSize(runLength) + 1
+		cursor += runLength
+	end
+	if encodedBytes + varUIntSize(runs) >= length * (1 - threshold) then
+		return false
+	end
+
+	writer:WriteU8(Tags.BufferRle)
+	writer:WriteVarUInt(length)
+	writer:WriteVarUInt(runs)
+	cursor = 0
+	while cursor < length do
+		local byte = buffer.readu8(value, cursor)
+		local runLength = 1
+		while cursor + runLength < length and buffer.readu8(value, cursor + runLength) == byte do
+			runLength += 1
+		end
+		writer:WriteVarUInt(runLength)
+		writer:WriteU8(byte)
+		cursor += runLength
+	end
+	return true
+end
+
+local writeValue: (Writer, any, EncodeContext, number, boolean?) -> ()
+local readValue: (Reader, DecodeContext, number) -> any
+
+local function writeRoblox(writer: Writer, value: any, valueType: string, context: EncodeContext): boolean
+	if valueType == "Vector2" then
+		writer:WriteU8(Tags.Vector2)
+		writer:WriteF32(value.X)
+		writer:WriteF32(value.Y)
+	elseif valueType == "Vector3" then
+		writer:WriteU8(Tags.Vector3)
+		writer:WriteF32(value.X)
+		writer:WriteF32(value.Y)
+		writer:WriteF32(value.Z)
+	elseif valueType == "Vector2int16" then
+		writer:WriteU8(Tags.Vector2int16)
+		writer:WriteI16(value.X)
+		writer:WriteI16(value.Y)
+	elseif valueType == "Vector3int16" then
+		writer:WriteU8(Tags.Vector3int16)
+		writer:WriteI16(value.X)
+		writer:WriteI16(value.Y)
+		writer:WriteI16(value.Z)
+	elseif valueType == "CFrame" then
+		writer:WriteU8(Tags.CFrame)
+		local components = {value:GetComponents()}
+		for index = 1, 12 do
+			writer:WriteF64(components[index])
+		end
+	elseif valueType == "Color3" then
+		writer:WriteU8(Tags.Color3)
+		writer:WriteF32(value.R)
+		writer:WriteF32(value.G)
+		writer:WriteF32(value.B)
+	elseif valueType == "BrickColor" then
+		writer:WriteU8(Tags.BrickColor)
+		writer:WriteU16(value.Number)
+	elseif valueType == "UDim" then
+		writer:WriteU8(Tags.UDim)
+		writer:WriteF32(value.Scale)
+		writer:WriteVarInt(value.Offset)
+	elseif valueType == "UDim2" then
+		writer:WriteU8(Tags.UDim2)
+		writer:WriteF32(value.X.Scale)
+		writer:WriteVarInt(value.X.Offset)
+		writer:WriteF32(value.Y.Scale)
+		writer:WriteVarInt(value.Y.Offset)
+	elseif valueType == "Rect" then
+		writer:WriteU8(Tags.Rect)
+		writer:WriteF32(value.Min.X)
+		writer:WriteF32(value.Min.Y)
+		writer:WriteF32(value.Max.X)
+		writer:WriteF32(value.Max.Y)
+	elseif valueType == "Ray" then
+		writer:WriteU8(Tags.Ray)
+		writer:WriteF32(value.Origin.X)
+		writer:WriteF32(value.Origin.Y)
+		writer:WriteF32(value.Origin.Z)
+		writer:WriteF32(value.Direction.X)
+		writer:WriteF32(value.Direction.Y)
+		writer:WriteF32(value.Direction.Z)
+	elseif valueType == "NumberRange" then
+		writer:WriteU8(Tags.NumberRange)
+		writer:WriteF32(value.Min)
+		writer:WriteF32(value.Max)
+	elseif valueType == "NumberSequenceKeypoint" then
+		writer:WriteU8(Tags.NumberSequenceKeypoint)
+		writer:WriteF32(value.Time)
+		writer:WriteF32(value.Value)
+		writer:WriteF32(value.Envelope)
+	elseif valueType == "NumberSequence" then
+		writer:WriteU8(Tags.NumberSequence)
+		local points = value.Keypoints
+		if #points > context.config.maxCollectionCount then error("[Waffles] NumberSequence has too many keypoints", 2) end
+		writer:WriteVarUInt(#points)
+		for _, point in points do
+			writer:WriteF32(point.Time)
+			writer:WriteF32(point.Value)
+			writer:WriteF32(point.Envelope)
+		end
+	elseif valueType == "ColorSequenceKeypoint" then
+		writer:WriteU8(Tags.ColorSequenceKeypoint)
+		writer:WriteF32(value.Time)
+		writer:WriteF32(value.Value.R)
+		writer:WriteF32(value.Value.G)
+		writer:WriteF32(value.Value.B)
+	elseif valueType == "ColorSequence" then
+		writer:WriteU8(Tags.ColorSequence)
+		local points = value.Keypoints
+		if #points > context.config.maxCollectionCount then error("[Waffles] ColorSequence has too many keypoints", 2) end
+		writer:WriteVarUInt(#points)
+		for _, point in points do
+			writer:WriteF32(point.Time)
+			writer:WriteF32(point.Value.R)
+			writer:WriteF32(point.Value.G)
+			writer:WriteF32(point.Value.B)
+		end
+	elseif valueType == "DateTime" then
+		writer:WriteU8(Tags.DateTime)
+		writer:WriteVarInt(value.UnixTimestampMillis)
+	elseif valueType == "Font" then
+		writer:WriteU8(Tags.Font)
+		writeCachedString(writer, value.Family, context, false)
+		writeCachedString(writer, value.Weight.Name, context, false)
+		writeCachedString(writer, value.Style.Name, context, false)
+	elseif valueType == "EnumItem" then
+		writer:WriteU8(Tags.EnumItem)
+		local enumText = tostring(value.EnumType)
+		local enumTypeName = string.match(enumText, "^Enum%.(.+)$") or enumText
+		if enumTypeName == "" or enumTypeName == "Enum" then
+			error("[Waffles] Unable to identify EnumItem type", 2)
+		end
+		writeCachedString(writer, enumTypeName, context, false)
+		writeCachedString(writer, value.Name, context, false)
+	else
+		return false
+	end
+	return true
+end
+
+writeValue = function(writer: Writer, value: any, context: EncodeContext, depth: number, isKey: boolean?)
+	checkDepth(context.config, depth)
+
+	for _, converter in context.converters do
+		if converter.CanSerialize(value) then
+			writer:WriteU8(Tags.Custom)
+			writer:WriteVarUInt(converter.Id)
+			converter.Serialize(writer, value)
+			return
+		end
+	end
+
+	local valueType = typeof(value)
+	if value == nil then
+		writer:WriteU8(Tags.Nil)
+	elseif valueType == "boolean" then
+		writer:WriteU8(if value then Tags.True else Tags.False)
+	elseif valueType == "number" then
+		if value ~= value then
+			writer:WriteU8(Tags.Float64)
+			writer:WriteF64(value)
+		elseif value % 1 == 0 and math.abs(value) <= 4503599627370495 and not (value == 0 and 1 / value == -math.huge) then
+			writer:WriteU8(Tags.Integer)
+			writer:WriteVarInt(value)
+		else
+			buffer.writef32(floatScratch, 0, value)
+			if buffer.readf32(floatScratch, 0) == value then
+				writer:WriteU8(Tags.Float32)
+				writer:WriteF32(value)
+			else
+				writer:WriteU8(Tags.Float64)
+				writer:WriteF64(value)
+			end
+		end
+	elseif valueType == "string" then
+		if #value > context.config.maxStringBytes then
+			error(string.format("[Waffles] String length %d exceeds limit %d", #value, context.config.maxStringBytes), 2)
+		end
+		writeCachedString(writer, value, context, isKey == true)
+	elseif valueType == "buffer" then
+		local length = buffer.len(value)
+		if length > context.config.maxBufferBytes then
+			error(string.format("[Waffles] Buffer length %d exceeds limit %d", length, context.config.maxBufferBytes), 2)
+		end
+		if not tryWriteRle(writer, value, context.config.rleThreshold) then
+			writer:WriteU8(Tags.Buffer)
+			writer:WriteBuffer(value)
+		end
+	elseif valueType == "table" then
+		if context.active[value] then
+			error("[Waffles] Cyclic tables are not supported", 2)
+		end
+		context.active[value] = true
+		local array, count = isArray(value)
+		if count > context.config.maxCollectionCount then
+			context.active[value] = nil
+			error(string.format("[Waffles] Table element count %d exceeds limit %d", count, context.config.maxCollectionCount), 2)
+		end
+		if array then
+			writer:WriteU8(Tags.Array)
+			writer:WriteVarUInt(count)
+			for index = 1, count do
+				writeValue(writer, value[index], context, depth + 1)
+			end
+		else
+			local keys, allStrings = sortedKeys(value, count, context.config)
+			local signature = if allStrings then layoutSignature(keys, math.min(context.config.maxPayloadBytes, 65536)) else nil
+			if signature then
+				local layoutId = context.layouts[signature]
+				if layoutId then
+					writer:WriteU8(Tags.LayoutReference)
+					writer:WriteVarUInt(layoutId)
+				else
+					context.layoutCount += 1
+					layoutId = context.layoutCount
+					context.layouts[signature] = layoutId
+					writer:WriteU8(Tags.LayoutDefinition)
+					writer:WriteVarUInt(count)
+					for _, key in keys do
+						writeValue(writer, key, context, depth + 1, true)
+					end
+				end
+				for _, key in keys do
+					writeValue(writer, value[key], context, depth + 1)
+				end
+			else
+				writer:WriteU8(Tags.Map)
+				writer:WriteVarUInt(count)
+				for _, key in keys do
+					writeValue(writer, key, context, depth + 1, true)
+					writeValue(writer, value[key], context, depth + 1)
+				end
+			end
+		end
+		context.active[value] = nil
+	elseif not writeRoblox(writer, value, valueType, context) then
+		error("[Waffles] Unsupported value type: " .. valueType, 2)
+	end
+end
+
+local function checkedCount(reader: Reader, context: DecodeContext, label: string, minimumBytesPerItem: number): number
+	local count = reader:ReadVarUInt(label .. " count")
+	if count > context.config.maxCollectionCount then
+		error(string.format("[Waffles] Declared %s count %d exceeds limit %d", label, count, context.config.maxCollectionCount), 3)
+	end
+	if count * minimumBytesPerItem > reader:Remaining() then
+		error(string.format("[Waffles] Impossible %s count %d for remaining payload", label, count), 3)
+	end
+	return count
+end
+
+local function enumItem(enumTypeName: string, itemName: string): any
+	local okType, enumType = pcall(function()
+		return (Enum :: any)[enumTypeName]
+	end)
+	if not okType or enumType == nil then
+		error("[Waffles] Invalid enum metadata: " .. enumTypeName, 3)
+	end
+	local okItem, item = pcall(function()
+		return enumType[itemName]
+	end)
+	if not okItem or item == nil then
+		error("[Waffles] Invalid enum metadata: " .. enumTypeName .. "." .. itemName, 3)
+	end
+	return item
+end
+
+readValue = function(reader: Reader, context: DecodeContext, depth: number): any
+	checkDepth(context.config, depth)
+	local tag = reader:ReadU8("type tag")
+	if tag == Tags.Nil then
+		return nil
+	elseif tag == Tags.False then
+		return false
+	elseif tag == Tags.True then
+		return true
+	elseif tag == Tags.Integer then
+		return reader:ReadVarInt("integer")
+	elseif tag == Tags.Float32 then
+		return reader:ReadF32("number")
+	elseif tag == Tags.Float64 then
+		return reader:ReadF64("number")
+	elseif tag == Tags.String or tag == Tags.StringReference or tag == Tags.CommonKey then
+		return readCachedString(reader, context, tag)
+	elseif tag == Tags.Buffer then
+		return reader:ReadBuffer(context.config.maxBufferBytes, "buffer")
+	elseif tag == Tags.BufferRle then
+		local length = reader:ReadVarUInt("RLE output length")
+		if length > context.config.maxBufferBytes then
+			error(string.format("[Waffles] Declared RLE buffer length %d exceeds limit %d", length, context.config.maxBufferBytes), 2)
+		end
+		local runCount = checkedCount(reader, context, "RLE run", 2)
+		local runLengths = table.create(runCount)
+		local runBytes = table.create(runCount)
+		local totalLength = 0
+		for index = 1, runCount do
+			local runLength = reader:ReadVarUInt("RLE run length")
+			local byte = reader:ReadU8("RLE byte")
+			if runLength == 0 or totalLength + runLength > length then
+				error("[Waffles] Invalid RLE run length", 2)
+			end
+			runLengths[index] = runLength
+			runBytes[index] = byte
+			totalLength += runLength
+		end
+		if totalLength ~= length then
+			error("[Waffles] RLE data does not fill its declared output", 2)
+		end
+		local output = buffer.create(length)
+		local cursor = 0
+		for index = 1, runCount do
+			local runLength = runLengths[index]
+			buffer.fill(output, cursor, runBytes[index], runLength)
+			cursor += runLength
+		end
+		return output
+	elseif tag == Tags.Array then
+		local count = checkedCount(reader, context, "array", 1)
+		local result = table.create(count)
+		for index = 1, count do
+			result[index] = readValue(reader, context, depth + 1)
+		end
+		return result
+	elseif tag == Tags.Map then
+		local count = checkedCount(reader, context, "map", 2)
+		local result = {}
+		local seen = {}
+		for _ = 1, count do
+			local key = readValue(reader, context, depth + 1)
+			local keyType = type(key)
+			if key == nil or (keyType ~= "boolean" and keyType ~= "number" and keyType ~= "string") or (keyType == "number" and key ~= key) then
+				error("[Waffles] Invalid dictionary key in payload", 2)
+			end
+			if seen[key] then error("[Waffles] Duplicate dictionary key in payload", 2) end
+			seen[key] = true
+			result[key] = readValue(reader, context, depth + 1)
+		end
+		return result
+	elseif tag == Tags.LayoutDefinition then
+		local count = checkedCount(reader, context, "layout", 2)
+		local keys = table.create(count)
+		local seen = {}
+		for index = 1, count do
+			local key = readValue(reader, context, depth + 1)
+			if type(key) ~= "string" or seen[key] then
+				error("[Waffles] Invalid or duplicate layout key", 2)
+			end
+			seen[key] = true
+			keys[index] = key
+		end
+		table.insert(context.layouts, keys)
+		local result = {}
+		for _, key in keys do
+			result[key] = readValue(reader, context, depth + 1)
+		end
+		return result
+	elseif tag == Tags.LayoutReference then
+		local id = reader:ReadVarUInt("layout reference")
+		local keys = context.layouts[id]
+		if keys == nil then
+			error(string.format("[Waffles] Invalid layout reference: %d", id), 2)
+		end
+		if #keys > reader:Remaining() then
+			error("[Waffles] Layout value count exceeds remaining payload", 2)
+		end
+		local result = {}
+		for _, key in keys do
+			result[key] = readValue(reader, context, depth + 1)
+		end
+		return result
+	elseif tag == Tags.Vector2 then
+		return Vector2.new(reader:ReadF32("Vector2.X"), reader:ReadF32("Vector2.Y"))
+	elseif tag == Tags.Vector3 then
+		return Vector3.new(reader:ReadF32("Vector3.X"), reader:ReadF32("Vector3.Y"), reader:ReadF32("Vector3.Z"))
+	elseif tag == Tags.Vector2int16 then
+		return Vector2int16.new(reader:ReadI16("Vector2int16.X"), reader:ReadI16("Vector2int16.Y"))
+	elseif tag == Tags.Vector3int16 then
+		return Vector3int16.new(reader:ReadI16("Vector3int16.X"), reader:ReadI16("Vector3int16.Y"), reader:ReadI16("Vector3int16.Z"))
+	elseif tag == Tags.CFrame then
+		local c = table.create(12)
+		for index = 1, 12 do
+			c[index] = reader:ReadF64("CFrame component")
+		end
+		return CFrame.new(table.unpack(c, 1, 12))
+	elseif tag == Tags.Color3 then
+		return Color3.new(reader:ReadF32("Color3.R"), reader:ReadF32("Color3.G"), reader:ReadF32("Color3.B"))
+	elseif tag == Tags.BrickColor then
+		local number = reader:ReadU16("BrickColor number")
+		local ok, value = pcall(BrickColor.new, number)
+		if not ok or value.Number ~= number then
+			error("[Waffles] Invalid BrickColor number", 2)
+		end
+		return value
+	elseif tag == Tags.UDim then
+		return UDim.new(reader:ReadF32("UDim scale"), reader:ReadVarInt("UDim offset"))
+	elseif tag == Tags.UDim2 then
+		return UDim2.new(reader:ReadF32("UDim2 X scale"), reader:ReadVarInt("UDim2 X offset"), reader:ReadF32("UDim2 Y scale"), reader:ReadVarInt("UDim2 Y offset"))
+	elseif tag == Tags.Rect then
+		return Rect.new(reader:ReadF32("Rect Min.X"), reader:ReadF32("Rect Min.Y"), reader:ReadF32("Rect Max.X"), reader:ReadF32("Rect Max.Y"))
+	elseif tag == Tags.Ray then
+		local origin = Vector3.new(reader:ReadF32("Ray Origin.X"), reader:ReadF32("Ray Origin.Y"), reader:ReadF32("Ray Origin.Z"))
+		local direction = Vector3.new(reader:ReadF32("Ray Direction.X"), reader:ReadF32("Ray Direction.Y"), reader:ReadF32("Ray Direction.Z"))
+		return Ray.new(origin, direction)
+	elseif tag == Tags.NumberRange then
+		return NumberRange.new(reader:ReadF32("NumberRange.Min"), reader:ReadF32("NumberRange.Max"))
+	elseif tag == Tags.NumberSequenceKeypoint then
+		return NumberSequenceKeypoint.new(reader:ReadF32("keypoint time"), reader:ReadF32("keypoint value"), reader:ReadF32("keypoint envelope"))
+	elseif tag == Tags.NumberSequence then
+		local count = checkedCount(reader, context, "NumberSequence keypoint", 12)
+		local points = table.create(count)
+		for index = 1, count do
+			points[index] = NumberSequenceKeypoint.new(reader:ReadF32("keypoint time"), reader:ReadF32("keypoint value"), reader:ReadF32("keypoint envelope"))
+		end
+		local ok, result = pcall(NumberSequence.new, points)
+		if not ok then error("[Waffles] Invalid NumberSequence payload", 2) end
+		return result
+	elseif tag == Tags.ColorSequenceKeypoint then
+		local time = reader:ReadF32("keypoint time")
+		return ColorSequenceKeypoint.new(time, Color3.new(reader:ReadF32("keypoint R"), reader:ReadF32("keypoint G"), reader:ReadF32("keypoint B")))
+	elseif tag == Tags.ColorSequence then
+		local count = checkedCount(reader, context, "ColorSequence keypoint", 16)
+		local points = table.create(count)
+		for index = 1, count do
+			local time = reader:ReadF32("keypoint time")
+			points[index] = ColorSequenceKeypoint.new(time, Color3.new(reader:ReadF32("keypoint R"), reader:ReadF32("keypoint G"), reader:ReadF32("keypoint B")))
+		end
+		local ok, result = pcall(ColorSequence.new, points)
+		if not ok then error("[Waffles] Invalid ColorSequence payload", 2) end
+		return result
+	elseif tag == Tags.DateTime then
+		local ok, result = pcall(DateTime.fromUnixTimestampMillis, reader:ReadVarInt("DateTime milliseconds"))
+		if not ok then error("[Waffles] Invalid DateTime payload", 2) end
+		return result
+	elseif tag == Tags.Font then
+		local family = readValue(reader, context, depth + 1)
+		local weightName = readValue(reader, context, depth + 1)
+		local styleName = readValue(reader, context, depth + 1)
+		if type(family) ~= "string" or type(weightName) ~= "string" or type(styleName) ~= "string" then
+			error("[Waffles] Invalid Font metadata", 2)
+		end
+		local weight = enumItem("FontWeight", weightName)
+		local style = enumItem("FontStyle", styleName)
+		local ok, result = pcall(Font.new, family, weight, style)
+		if not ok then error("[Waffles] Invalid Font payload", 2) end
+		return result
+	elseif tag == Tags.EnumItem then
+		local enumTypeName = readValue(reader, context, depth + 1)
+		local itemName = readValue(reader, context, depth + 1)
+		if type(enumTypeName) ~= "string" or type(itemName) ~= "string" then
+			error("[Waffles] Invalid enum metadata", 2)
+		end
+		return enumItem(enumTypeName, itemName)
+	elseif tag == Tags.Custom then
+		local id = reader:ReadVarUInt("converter identifier")
+		local converter = context.convertersById[id]
+		if converter == nil then
+			error(string.format("[Waffles] Unknown converter identifier: %d", id), 2)
+		end
+		return converter.Deserialize(reader)
+	end
+	error(string.format("[Waffles] Invalid type tag: %d", tag), 2)
+end
+
+function AutoCodec.newEncodeContext(config: Config, commonKeyIds: {[string]: number}, converters: {Converter}): EncodeContext
+	return {
+		config = config,
+		strings = {},
+		stringCount = 0,
+		layouts = {},
+		layoutCount = 0,
+		active = {},
+		commonKeyIds = commonKeyIds,
+		converters = converters,
+	}
+end
+
+function AutoCodec.newDecodeContext(config: Config, commonKeys: {string}, convertersById: {[number]: Converter}): DecodeContext
+	return {
+		config = config,
+		strings = {},
+		layouts = {},
+		commonKeys = commonKeys,
+		convertersById = convertersById,
+	}
+end
+
+AutoCodec.writeValue = writeValue
+AutoCodec.readValue = readValue
+
+return AutoCodec
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="4">
+          <Properties>
+            <string name="Name">BufferUtil</string>
+            <string name="Source"><![CDATA[--!strict
+
+local BufferUtil = {}
+
+function BufferUtil.Concat(...: buffer): buffer
+	local parts = {...}
+	local total = 0
+	for _, part in parts do
+		total += buffer.len(part)
+	end
+	local output = buffer.create(total)
+	local cursor = 0
+	for _, part in parts do
+		local length = buffer.len(part)
+		if length > 0 then
+			buffer.copy(output, cursor, part, 0, length)
+		end
+		cursor += length
+	end
+	return output
+end
+
+function BufferUtil.Slice(data: buffer, first: number?, last: number?): buffer
+	local length = buffer.len(data)
+	local startIndex = first or 0
+	local endIndex = last or length
+	if startIndex < 0 or endIndex < startIndex or endIndex > length then
+		error("[Waffles] Buffer.Slice indices are out of bounds", 2)
+	end
+	local output = buffer.create(endIndex - startIndex)
+	if endIndex > startIndex then
+		buffer.copy(output, 0, data, startIndex, endIndex - startIndex)
+	end
+	return output
+end
+
+function BufferUtil.Equals(a: buffer, b: buffer): boolean
+	local length = buffer.len(a)
+	if length ~= buffer.len(b) then
+		return false
+	end
+	for index = 0, length - 1 do
+		if buffer.readu8(a, index) ~= buffer.readu8(b, index) then
+			return false
+		end
+	end
+	return true
+end
+
+local HEX = "0123456789abcdef"
+
+function BufferUtil.ToHex(data: buffer): string
+	local result = table.create(buffer.len(data))
+	for index = 0, buffer.len(data) - 1 do
+		local byte = buffer.readu8(data, index)
+		local high = math.floor(byte / 16) + 1
+		local low = byte % 16 + 1
+		result[index + 1] = string.sub(HEX, high, high) .. string.sub(HEX, low, low)
+	end
+	return table.concat(result)
+end
+
+local function hexDigit(character: string): number?
+	local byte = string.byte(character)
+	if byte >= 48 and byte <= 57 then
+		return byte - 48
+	elseif byte >= 65 and byte <= 70 then
+		return byte - 55
+	elseif byte >= 97 and byte <= 102 then
+		return byte - 87
+	end
+	return nil
+end
+
+function BufferUtil.FromHex(text: string): buffer
+	if #text % 2 ~= 0 then
+		error("[Waffles] Hex text must contain an even number of characters", 2)
+	end
+	local output = buffer.create(#text / 2)
+	for index = 1, #text, 2 do
+		local high = hexDigit(string.sub(text, index, index))
+		local low = hexDigit(string.sub(text, index + 1, index + 1))
+		if high == nil or low == nil then
+			error(string.format("[Waffles] Invalid hex character at position %d", index), 2)
+		end
+		buffer.writeu8(output, (index - 1) / 2, high * 16 + low)
+	end
+	return output
+end
+
+return table.freeze(BufferUtil)
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="5">
+          <Properties>
+            <string name="Name">Reader</string>
+            <string name="Source"><![CDATA[--!strict
+
+local MAX_SAFE_INTEGER = 9007199254740991
+
+export type Reader = {
+	_data: buffer,
+	_cursor: number,
+	_length: number,
+	_maxVarintBytes: number,
+	ReadU8: (self: Reader, context: string?) -> number,
+	ReadU16: (self: Reader, context: string?) -> number,
+	ReadU32: (self: Reader, context: string?) -> number,
+	ReadI16: (self: Reader, context: string?) -> number,
+	ReadI32: (self: Reader, context: string?) -> number,
+	ReadF32: (self: Reader, context: string?) -> number,
+	ReadF64: (self: Reader, context: string?) -> number,
+	ReadVarUInt: (self: Reader, context: string?) -> number,
+	ReadVarInt: (self: Reader, context: string?) -> number,
+	ReadString: (self: Reader, maxLength: number, context: string?) -> string,
+	ReadRawString: (self: Reader, length: number, context: string?) -> string,
+	ReadBuffer: (self: Reader, maxLength: number, context: string?) -> buffer,
+	ReadRawBuffer: (self: Reader, length: number, context: string?) -> buffer,
+	Remaining: (self: Reader) -> number,
+	Position: (self: Reader) -> number,
+}
+
+local ReaderMethods = {}
+ReaderMethods.__index = ReaderMethods
+
+local function need(self: Reader, byteCount: number, context: string?)
+	if byteCount < 0 or self._cursor + byteCount > self._length then
+		error("[Waffles] Unexpected end of buffer while reading " .. (context or "value"), 3)
+	end
+end
+
+function ReaderMethods.ReadU8(self: Reader, context: string?): number
+	need(self, 1, context)
+	local value = buffer.readu8(self._data, self._cursor)
+	self._cursor += 1
+	return value
+end
+
+function ReaderMethods.ReadU16(self: Reader, context: string?): number
+	need(self, 2, context)
+	local value = buffer.readu16(self._data, self._cursor)
+	self._cursor += 2
+	return value
+end
+
+function ReaderMethods.ReadU32(self: Reader, context: string?): number
+	need(self, 4, context)
+	local value = buffer.readu32(self._data, self._cursor)
+	self._cursor += 4
+	return value
+end
+
+function ReaderMethods.ReadI16(self: Reader, context: string?): number
+	need(self, 2, context)
+	local value = buffer.readi16(self._data, self._cursor)
+	self._cursor += 2
+	return value
+end
+
+function ReaderMethods.ReadI32(self: Reader, context: string?): number
+	need(self, 4, context)
+	local value = buffer.readi32(self._data, self._cursor)
+	self._cursor += 4
+	return value
+end
+
+function ReaderMethods.ReadF32(self: Reader, context: string?): number
+	need(self, 4, context)
+	local value = buffer.readf32(self._data, self._cursor)
+	self._cursor += 4
+	return value
+end
+
+function ReaderMethods.ReadF64(self: Reader, context: string?): number
+	need(self, 8, context)
+	local value = buffer.readf64(self._data, self._cursor)
+	self._cursor += 8
+	return value
+end
+
+function ReaderMethods.ReadVarUInt(self: Reader, context: string?): number
+	local result = 0
+	local multiplier = 1
+	for byteIndex = 1, self._maxVarintBytes do
+		local byte = self:ReadU8(context or "variable-length integer")
+		local digit = byte % 128
+		if digit > math.floor((MAX_SAFE_INTEGER - result) / multiplier) then
+			error("[Waffles] Variable-length integer overflow", 2)
+		end
+		result += digit * multiplier
+		if byte < 128 then
+			if byteIndex > 1 and digit == 0 then
+				error("[Waffles] Malformed variable-length integer: non-canonical encoding", 2)
+			end
+			return result
+		end
+		multiplier *= 128
+	end
+	error("[Waffles] Malformed variable-length integer: too many continuation bytes", 2)
+end
+
+function ReaderMethods.ReadVarInt(self: Reader, context: string?): number
+	local zigzag = self:ReadVarUInt(context)
+	if zigzag > 9007199254740990 then
+		error("[Waffles] Signed variable-length integer overflow", 2)
+	end
+	if zigzag % 2 == 0 then
+		return zigzag / 2
+	end
+	return -(zigzag + 1) / 2
+end
+
+function ReaderMethods.ReadRawString(self: Reader, length: number, context: string?): string
+	need(self, length, context or "string")
+	local value = buffer.readstring(self._data, self._cursor, length)
+	self._cursor += length
+	return value
+end
+
+function ReaderMethods.ReadString(self: Reader, maxLength: number, context: string?): string
+	local length = self:ReadVarUInt("string length")
+	if length > maxLength then
+		error(string.format("[Waffles] Declared string length %d exceeds limit %d", length, maxLength), 2)
+	end
+	return self:ReadRawString(length, context or "string")
+end
+
+function ReaderMethods.ReadRawBuffer(self: Reader, length: number, context: string?): buffer
+	need(self, length, context or "buffer")
+	local value = buffer.create(length)
+	if length > 0 then
+		buffer.copy(value, 0, self._data, self._cursor, length)
+	end
+	self._cursor += length
+	return value
+end
+
+function ReaderMethods.ReadBuffer(self: Reader, maxLength: number, context: string?): buffer
+	local length = self:ReadVarUInt("buffer length")
+	if length > maxLength then
+		error(string.format("[Waffles] Declared buffer length %d exceeds limit %d", length, maxLength), 2)
+	end
+	return self:ReadRawBuffer(length, context or "buffer")
+end
+
+function ReaderMethods.Remaining(self: Reader): number
+	return self._length - self._cursor
+end
+
+function ReaderMethods.Position(self: Reader): number
+	return self._cursor
+end
+
+local pool: {Reader} = {}
+local ReaderModule = {}
+
+function ReaderModule.acquire(data: buffer, maxVarintBytes: number, poolingEnabled: boolean): Reader
+	if poolingEnabled and #pool > 0 then
+		local reader = table.remove(pool) :: Reader
+		reader._data = data
+		reader._cursor = 0
+		reader._length = buffer.len(data)
+		reader._maxVarintBytes = maxVarintBytes
+		return reader
+	end
+	return setmetatable({
+		_data = data,
+		_cursor = 0,
+		_length = buffer.len(data),
+		_maxVarintBytes = maxVarintBytes,
+	}, ReaderMethods) :: any
+end
+
+function ReaderModule.release(reader: Reader, poolingEnabled: boolean, maxReaders: number)
+	if poolingEnabled and #pool < maxReaders then
+		reader._data = buffer.create(0)
+		reader._cursor = 0
+		reader._length = 0
+		table.insert(pool, reader)
+	end
+end
+
+return ReaderModule
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="6">
+          <Properties>
+            <string name="Name">Schema</string>
+            <string name="Source"><![CDATA[--!strict
+
+type TypeDefinition = {
+	_wafflesType: boolean,
+	kind: string,
+	name: string,
+	[string]: any,
+}
+
+export type SchemaObject = {
+	Serialize: (self: SchemaObject, value: any) -> buffer,
+	Deserialize: (self: SchemaObject, data: buffer) -> any,
+	Validate: (self: SchemaObject, value: any) -> (boolean, string?),
+	Definition: TypeDefinition,
+	Hash: number,
+}
+
+type Runtime = {
+	serialize: (schema: any, value: any) -> buffer,
+	deserialize: (schema: any, data: buffer) -> any,
+	writeAny: (writer: any, value: any, context: any, depth: number) -> (),
+	readAny: (reader: any, context: any, depth: number) -> any,
+}
+
+local SchemaModule = {}
+local runtime: Runtime? = nil
+
+local function primitive(kind: string, name: string): TypeDefinition
+	return table.freeze({
+		_wafflesType = true,
+		kind = kind,
+		name = name,
+	}) :: any
+end
+
+local Types: {[string]: any} = {
+	Any = primitive("any", "any supported value"),
+	Nil = primitive("nil", "nil"),
+	Boolean = primitive("boolean", "boolean"),
+	String = primitive("string", "string"),
+	Number = primitive("number", "number"),
+	Integer = primitive("integer", "integer"),
+	Buffer = primitive("buffer", "buffer"),
+	Vector2 = primitive("Vector2", "Vector2"),
+	Vector3 = primitive("Vector3", "Vector3"),
+	Vector2int16 = primitive("Vector2int16", "Vector2int16"),
+	Vector3int16 = primitive("Vector3int16", "Vector3int16"),
+	CFrame = primitive("CFrame", "CFrame"),
+	Color3 = primitive("Color3", "Color3"),
+	BrickColor = primitive("BrickColor", "BrickColor"),
+	UDim = primitive("UDim", "UDim"),
+	UDim2 = primitive("UDim2", "UDim2"),
+	Rect = primitive("Rect", "Rect"),
+	Ray = primitive("Ray", "Ray"),
+	NumberRange = primitive("NumberRange", "NumberRange"),
+	NumberSequence = primitive("NumberSequence", "NumberSequence"),
+	NumberSequenceKeypoint = primitive("NumberSequenceKeypoint", "NumberSequenceKeypoint"),
+	ColorSequence = primitive("ColorSequence", "ColorSequence"),
+	ColorSequenceKeypoint = primitive("ColorSequenceKeypoint", "ColorSequenceKeypoint"),
+	DateTime = primitive("DateTime", "DateTime"),
+	Font = primitive("Font", "Font"),
+	EnumItem = primitive("EnumItem", "EnumItem"),
+}
+
+local function assertTypeDefinition(definition: any, argumentName: string): TypeDefinition
+	if type(definition) ~= "table" or definition._wafflesType ~= true then
+		error("[Waffles] " .. argumentName .. " must be a Waffles type definition", 3)
+	end
+	return definition
+end
+
+local function minimumBytes(definition: TypeDefinition): number
+	local kind = definition.kind
+	if kind == "nil" then return 0 end
+	if kind == "struct" then
+		local total = 0
+		for _, name in definition.names do total += minimumBytes(definition.fields[name]) end
+		return total
+	end
+	if kind == "tuple" then
+		local total = 0
+		for _, item in definition.items do total += minimumBytes(item) end
+		return total
+	end
+	return 1
+end
+
+function Types.Array(element: TypeDefinition): TypeDefinition
+	assertTypeDefinition(element, "Array element")
+	if minimumBytes(element) == 0 then
+		error("[Waffles] Array elements must encode at least one byte", 2)
+	end
+	return table.freeze({
+		_wafflesType = true,
+		kind = "array",
+		name = "array<" .. assertTypeDefinition(element, "Array element").name .. ">",
+		element = element,
+	}) :: any
+end
+
+function Types.Optional(inner: TypeDefinition): TypeDefinition
+	return table.freeze({
+		_wafflesType = true,
+		kind = "optional",
+		name = "optional<" .. assertTypeDefinition(inner, "Optional value").name .. ">",
+		inner = inner,
+	}) :: any
+end
+
+function Types.Map(key: TypeDefinition, value: TypeDefinition): TypeDefinition
+	assertTypeDefinition(key, "Map key")
+	assertTypeDefinition(value, "Map value")
+	local keyKind = key.kind
+	if keyKind ~= "boolean" and keyKind ~= "string" and keyKind ~= "number" and keyKind ~= "integer" and keyKind ~= "enum" then
+		error("[Waffles] Map keys must use Boolean, String, Number, Integer, or Enum", 2)
+	end
+	return table.freeze({
+		_wafflesType = true,
+		kind = "map",
+		name = "map<" .. key.name .. ", " .. value.name .. ">",
+		key = key,
+		value = value,
+	}) :: any
+end
+
+function Types.Struct(fields: {[string]: TypeDefinition}): TypeDefinition
+	if type(fields) ~= "table" then
+		error("[Waffles] Struct fields must be a table", 2)
+	end
+	local names = {}
+	local copied = {}
+	for name, definition in fields do
+		if type(name) ~= "string" then
+			error("[Waffles] Struct field names must be strings", 2)
+		end
+		copied[name] = assertTypeDefinition(definition, "Struct field " .. name)
+		table.insert(names, name)
+	end
+	table.sort(names)
+	return table.freeze({
+		_wafflesType = true,
+		kind = "struct",
+		name = "struct",
+		fields = table.freeze(copied),
+		names = table.freeze(names),
+	}) :: any
+end
+
+function Types.Tuple(...: TypeDefinition): TypeDefinition
+	local items = {...}
+	for index, definition in items do
+		assertTypeDefinition(definition, "Tuple item " .. tostring(index))
+	end
+	return table.freeze({
+		_wafflesType = true,
+		kind = "tuple",
+		name = "tuple",
+		items = table.freeze(items),
+	}) :: any
+end
+
+function Types.Enum(...: any): TypeDefinition
+	local values = {...}
+	if #values == 1 and type(values[1]) == "table" then
+		values = table.clone(values[1])
+	end
+	if #values == 0 then
+		error("[Waffles] Types.Enum requires at least one value", 2)
+	end
+	local lookup = {}
+	for index, value in values do
+		local kind = type(value)
+		if kind ~= "string" and kind ~= "number" then
+			error("[Waffles] Types.Enum values must be strings or numbers", 2)
+		end
+		if kind == "number" and value ~= value then
+			error("[Waffles] Types.Enum values cannot be NaN", 2)
+		end
+		if lookup[value] ~= nil then
+			error("[Waffles] Types.Enum values must be unique", 2)
+		end
+		lookup[value] = index
+	end
+	return table.freeze({
+		_wafflesType = true,
+		kind = "enum",
+		name = "enum",
+		values = table.freeze(values),
+		lookup = table.freeze(lookup),
+	}) :: any
+end
+
+local function received(value: any): string
+	local kind = typeof(value)
+	if kind == "string" then
+		return string.format("string %q", value)
+	elseif kind == "number" or kind == "boolean" or value == nil then
+		return kind .. " " .. tostring(value)
+	end
+	return kind
+end
+
+local function fail(path: string, expected: string, value: any): (boolean, string)
+	return false, string.format("[Waffles] Schema validation failed at %s: expected %s, received %s", path, expected, received(value))
+end
+
+local function validate(definition: TypeDefinition, value: any, path: string, depth: number, active: {[any]: boolean}): (boolean, string?)
+	if depth > 64 then
+		return false, "[Waffles] Schema validation exceeded maximum nesting depth at " .. path
+	end
+	local kind = definition.kind
+	if kind == "any" then
+		return true
+	elseif kind == "nil" then
+		if value ~= nil then return fail(path, definition.name, value) end
+		return true
+	elseif kind == "boolean" or kind == "string" or kind == "number" then
+		if typeof(value) ~= kind then return fail(path, definition.name, value) end
+		return true
+	elseif kind == "integer" then
+		if typeof(value) ~= "number" or value % 1 ~= 0 or math.abs(value) > 4503599627370495 then
+			return fail(path, definition.name, value)
+		end
+		return true
+	elseif kind == "optional" then
+		if value == nil then return true end
+		return validate(definition.inner, value, path, depth + 1, active)
+	elseif kind == "array" or kind == "tuple" or kind == "map" or kind == "struct" then
+		if typeof(value) ~= "table" then return fail(path, definition.name, value) end
+		if active[value] then
+			return false, "[Waffles] Schema validation failed at " .. path .. ": cyclic tables are not supported"
+		end
+		active[value] = true
+		if kind == "array" then
+			local elementCount = 0
+			local maximumIndex = 0
+			for key in value do
+				if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then active[value] = nil; return fail(path, definition.name, value) end
+				elementCount += 1
+				maximumIndex = math.max(maximumIndex, key)
+			end
+			if maximumIndex ~= elementCount then active[value] = nil; return fail(path, "a contiguous " .. definition.name, value) end
+			for index = 1, elementCount do
+				local ok, message = validate(definition.element, value[index], string.format("%s[%d]", path, index), depth + 1, active)
+				if not ok then active[value] = nil; return false, message end
+			end
+		elseif kind == "tuple" then
+			for index, itemDefinition in definition.items do
+				local ok, message = validate(itemDefinition, value[index], string.format("%s[%d]", path, index), depth + 1, active)
+				if not ok then active[value] = nil; return false, message end
+			end
+		elseif kind == "map" then
+			for key, item in value do
+				local keyPath = path .. "[key]"
+				local okKey, keyMessage = validate(definition.key, key, keyPath, depth + 1, active)
+				if not okKey then active[value] = nil; return false, keyMessage end
+				local itemPath = if type(key) == "string" then path .. "." .. key else path .. "[" .. tostring(key) .. "]"
+				local okValue, valueMessage = validate(definition.value, item, itemPath, depth + 1, active)
+				if not okValue then active[value] = nil; return false, valueMessage end
+			end
+		else
+			for _, fieldName in definition.names do
+				local fieldDefinition = definition.fields[fieldName]
+				local ok, message = validate(fieldDefinition, value[fieldName], path .. "." .. fieldName, depth + 1, active)
+				if not ok then active[value] = nil; return false, message end
+			end
+		end
+		active[value] = nil
+		return true
+	elseif kind == "enum" then
+		if definition.lookup[value] == nil then return fail(path, "one of the schema enum values", value) end
+		return true
+	elseif kind == "buffer" then
+		if typeof(value) ~= "buffer" then return fail(path, definition.name, value) end
+		return true
+	else
+		if typeof(value) ~= kind then return fail(path, definition.name, value) end
+		return true
+	end
+end
+
+local function schemaKeyRank(value: any): number
+	local kind = type(value)
+	if kind == "boolean" then return 1 end
+	if kind == "number" then return 2 end
+	if kind == "string" then return 3 end
+	return 99
+end
+
+local function sortedMapKeys(value: {[any]: any}): {any}
+	local keys = {}
+	for key in value do table.insert(keys, key) end
+	table.sort(keys, function(a, b)
+		local rankA, rankB = schemaKeyRank(a), schemaKeyRank(b)
+		if rankA ~= rankB then return rankA < rankB end
+		if rankA == 1 then return a == false end
+		return a < b
+	end)
+	return keys
+end
+
+local write: (TypeDefinition, any, any, any, number) -> ()
+local read: (TypeDefinition, any, any, number) -> any
+
+write = function(definition: TypeDefinition, writer: any, value: any, autoContext: any, depth: number)
+	if depth > autoContext.config.maxDepth then error("[Waffles] Maximum schema nesting depth exceeded", 2) end
+	local kind = definition.kind
+	if kind == "any" then
+		(runtime :: Runtime).writeAny(writer, value, autoContext, depth)
+	elseif kind == "nil" then
+		return
+	elseif kind == "boolean" then
+		writer:WriteU8(if value then 1 else 0)
+	elseif kind == "string" then
+		if #value > autoContext.config.maxStringBytes then error("[Waffles] Schema string exceeds configured length limit", 2) end
+		writer:WriteString(value)
+	elseif kind == "number" then
+		writer:WriteF64(value)
+	elseif kind == "integer" then
+		writer:WriteVarInt(value)
+	elseif kind == "buffer" then
+		if buffer.len(value) > autoContext.config.maxBufferBytes then error("[Waffles] Schema buffer exceeds configured length limit", 2) end
+		writer:WriteBuffer(value)
+	elseif kind == "optional" then
+		if value == nil then writer:WriteU8(0) else writer:WriteU8(1); write(definition.inner, writer, value, autoContext, depth + 1) end
+	elseif kind == "array" then
+		if #value > autoContext.config.maxCollectionCount then error("[Waffles] Schema array exceeds configured count limit", 2) end
+		writer:WriteVarUInt(#value)
+		for index = 1, #value do write(definition.element, writer, value[index], autoContext, depth + 1) end
+	elseif kind == "map" then
+		local keys = sortedMapKeys(value)
+		if #keys > autoContext.config.maxCollectionCount then error("[Waffles] Schema map exceeds configured count limit", 2) end
+		writer:WriteVarUInt(#keys)
+		for _, key in keys do
+			write(definition.key, writer, key, autoContext, depth + 1)
+			write(definition.value, writer, value[key], autoContext, depth + 1)
+		end
+	elseif kind == "struct" then
+		for _, name in definition.names do write(definition.fields[name], writer, value[name], autoContext, depth + 1) end
+	elseif kind == "tuple" then
+		for index, itemDefinition in definition.items do write(itemDefinition, writer, value[index], autoContext, depth + 1) end
+	elseif kind == "enum" then
+		writer:WriteVarUInt(definition.lookup[value] - 1)
+	elseif kind == "Vector2" then
+		writer:WriteF32(value.X); writer:WriteF32(value.Y)
+	elseif kind == "Vector3" then
+		writer:WriteF32(value.X); writer:WriteF32(value.Y); writer:WriteF32(value.Z)
+	elseif kind == "Vector2int16" then
+		writer:WriteI16(value.X); writer:WriteI16(value.Y)
+	elseif kind == "Vector3int16" then
+		writer:WriteI16(value.X); writer:WriteI16(value.Y); writer:WriteI16(value.Z)
+	elseif kind == "CFrame" then
+		local c = {value:GetComponents()}; for index = 1, 12 do writer:WriteF64(c[index]) end
+	elseif kind == "Color3" then
+		writer:WriteF32(value.R); writer:WriteF32(value.G); writer:WriteF32(value.B)
+	elseif kind == "BrickColor" then
+		writer:WriteU16(value.Number)
+	elseif kind == "UDim" then
+		writer:WriteF32(value.Scale); writer:WriteVarInt(value.Offset)
+	elseif kind == "UDim2" then
+		writer:WriteF32(value.X.Scale); writer:WriteVarInt(value.X.Offset); writer:WriteF32(value.Y.Scale); writer:WriteVarInt(value.Y.Offset)
+	elseif kind == "Rect" then
+		writer:WriteF32(value.Min.X); writer:WriteF32(value.Min.Y); writer:WriteF32(value.Max.X); writer:WriteF32(value.Max.Y)
+	elseif kind == "Ray" then
+		writer:WriteF32(value.Origin.X); writer:WriteF32(value.Origin.Y); writer:WriteF32(value.Origin.Z); writer:WriteF32(value.Direction.X); writer:WriteF32(value.Direction.Y); writer:WriteF32(value.Direction.Z)
+	elseif kind == "NumberRange" then
+		writer:WriteF32(value.Min); writer:WriteF32(value.Max)
+	elseif kind == "DateTime" then
+		writer:WriteVarInt(value.UnixTimestampMillis)
+	else
+		-- Less common schema datatypes use the automatic codec. They retain one
+		-- compact tag, while the common primitives above remain completely tagless.
+		(runtime :: Runtime).writeAny(writer, value, autoContext, depth)
+	end
+end
+
+local function checkedSchemaCount(reader: any, context: any, label: string): number
+	local count = reader:ReadVarUInt(label .. " count")
+	if count > context.config.maxCollectionCount or count > reader:Remaining() then
+		error("[Waffles] Invalid or excessive schema " .. label .. " count", 3)
+	end
+	return count
+end
+
+read = function(definition: TypeDefinition, reader: any, autoContext: any, depth: number): any
+	local kind = definition.kind
+	if depth > autoContext.config.maxDepth then error("[Waffles] Maximum schema nesting depth exceeded", 2) end
+	if kind == "any" then
+		return (runtime :: Runtime).readAny(reader, autoContext, depth)
+	elseif kind == "nil" then
+		return nil
+	elseif kind == "boolean" then
+		local byte = reader:ReadU8("schema boolean")
+		if byte > 1 then error("[Waffles] Invalid schema boolean", 2) end
+		return byte == 1
+	elseif kind == "string" then
+		return reader:ReadString(autoContext.config.maxStringBytes, "schema string")
+	elseif kind == "number" then
+		return reader:ReadF64("schema number")
+	elseif kind == "integer" then
+		return reader:ReadVarInt("schema integer")
+	elseif kind == "buffer" then
+		return reader:ReadBuffer(autoContext.config.maxBufferBytes, "schema buffer")
+	elseif kind == "optional" then
+		local present = reader:ReadU8("optional marker")
+		if present == 0 then return nil elseif present ~= 1 then error("[Waffles] Invalid optional marker", 2) end
+		return read(definition.inner, reader, autoContext, depth + 1)
+	elseif kind == "array" then
+		local count = checkedSchemaCount(reader, autoContext, "array")
+		local result = table.create(count)
+		for index = 1, count do result[index] = read(definition.element, reader, autoContext, depth + 1) end
+		return result
+	elseif kind == "map" then
+		local count = checkedSchemaCount(reader, autoContext, "map")
+		local result = {}
+		local seen = {}
+		for _ = 1, count do
+			local key = read(definition.key, reader, autoContext, depth + 1)
+			if key == nil or (type(key) == "number" and key ~= key) then error("[Waffles] Invalid schema map key", 2) end
+			if seen[key] then error("[Waffles] Duplicate schema map key", 2) end
+			seen[key] = true
+			result[key] = read(definition.value, reader, autoContext, depth + 1)
+		end
+		return result
+	elseif kind == "struct" then
+		local result = {}
+		for _, name in definition.names do result[name] = read(definition.fields[name], reader, autoContext, depth + 1) end
+		return result
+	elseif kind == "tuple" then
+		local result = table.create(#definition.items)
+		for index, itemDefinition in definition.items do result[index] = read(itemDefinition, reader, autoContext, depth + 1) end
+		return result
+	elseif kind == "enum" then
+		local index = reader:ReadVarUInt("schema enum") + 1
+		local value = definition.values[index]
+		if value == nil then error("[Waffles] Invalid schema enum identifier", 2) end
+		return value
+	elseif kind == "Vector2" then
+		return Vector2.new(reader:ReadF32("Vector2.X"), reader:ReadF32("Vector2.Y"))
+	elseif kind == "Vector3" then
+		return Vector3.new(reader:ReadF32("Vector3.X"), reader:ReadF32("Vector3.Y"), reader:ReadF32("Vector3.Z"))
+	elseif kind == "Vector2int16" then
+		return Vector2int16.new(reader:ReadI16("Vector2int16.X"), reader:ReadI16("Vector2int16.Y"))
+	elseif kind == "Vector3int16" then
+		return Vector3int16.new(reader:ReadI16("Vector3int16.X"), reader:ReadI16("Vector3int16.Y"), reader:ReadI16("Vector3int16.Z"))
+	elseif kind == "CFrame" then
+		local c = table.create(12); for index = 1, 12 do c[index] = reader:ReadF64("CFrame component") end
+		return CFrame.new(table.unpack(c, 1, 12))
+	elseif kind == "Color3" then
+		return Color3.new(reader:ReadF32("Color3.R"), reader:ReadF32("Color3.G"), reader:ReadF32("Color3.B"))
+	elseif kind == "BrickColor" then
+		local number = reader:ReadU16("BrickColor number")
+		local value = BrickColor.new(number)
+		if value.Number ~= number then error("[Waffles] Invalid BrickColor number", 2) end
+		return value
+	elseif kind == "UDim" then
+		return UDim.new(reader:ReadF32("UDim scale"), reader:ReadVarInt("UDim offset"))
+	elseif kind == "UDim2" then
+		return UDim2.new(reader:ReadF32("UDim2 X scale"), reader:ReadVarInt("UDim2 X offset"), reader:ReadF32("UDim2 Y scale"), reader:ReadVarInt("UDim2 Y offset"))
+	elseif kind == "Rect" then
+		return Rect.new(reader:ReadF32("Rect Min.X"), reader:ReadF32("Rect Min.Y"), reader:ReadF32("Rect Max.X"), reader:ReadF32("Rect Max.Y"))
+	elseif kind == "Ray" then
+		local origin = Vector3.new(reader:ReadF32("Ray Origin.X"), reader:ReadF32("Ray Origin.Y"), reader:ReadF32("Ray Origin.Z"))
+		local direction = Vector3.new(reader:ReadF32("Ray Direction.X"), reader:ReadF32("Ray Direction.Y"), reader:ReadF32("Ray Direction.Z"))
+		return Ray.new(origin, direction)
+	elseif kind == "NumberRange" then
+		return NumberRange.new(reader:ReadF32("NumberRange.Min"), reader:ReadF32("NumberRange.Max"))
+	elseif kind == "DateTime" then
+		return DateTime.fromUnixTimestampMillis(reader:ReadVarInt("DateTime milliseconds"))
+	end
+	return (runtime :: Runtime).readAny(reader, autoContext, depth)
+end
+
+local function descriptorText(definition: TypeDefinition): string
+	local kind = definition.kind
+	if kind == "array" then return "array(" .. descriptorText(definition.element) .. ")" end
+	if kind == "optional" then return "optional(" .. descriptorText(definition.inner) .. ")" end
+	if kind == "map" then return "map(" .. descriptorText(definition.key) .. "," .. descriptorText(definition.value) .. ")" end
+	if kind == "tuple" then
+		local parts = {}; for _, item in definition.items do table.insert(parts, descriptorText(item)) end
+		return "tuple(" .. table.concat(parts, ",") .. ")"
+	end
+	if kind == "struct" then
+		local parts = {}; for _, name in definition.names do table.insert(parts, #name .. ":" .. name .. "=" .. descriptorText(definition.fields[name])) end
+		return "struct(" .. table.concat(parts, ",") .. ")"
+	end
+	if kind == "enum" then
+		local parts = {}; for _, value in definition.values do local text = tostring(value); table.insert(parts, type(value) .. ":" .. #text .. ":" .. text) end
+		return "enum(" .. table.concat(parts, ",") .. ")"
+	end
+	return kind
+end
+
+local function hashDefinition(definition: TypeDefinition): number
+	local hash = 5381
+	local text = descriptorText(definition)
+	for index = 1, #text do
+		hash = (hash * 33 + string.byte(text, index)) % 4294967296
+	end
+	return hash
+end
+
+local SchemaMethods = {}
+SchemaMethods.__index = SchemaMethods
+
+function SchemaMethods.Serialize(self: any, value: any): buffer
+	return (runtime :: Runtime).serialize(self, value)
+end
+
+function SchemaMethods.Deserialize(self: any, data: buffer): any
+	return (runtime :: Runtime).deserialize(self, data)
+end
+
+function SchemaMethods.Validate(self: any, value: any): (boolean, string?)
+	return validate(self.Definition, value, "value", 0, {})
+end
+
+function SchemaModule.create(definitionOrFields: any): SchemaObject
+	local definition: TypeDefinition
+	if type(definitionOrFields) == "table" and definitionOrFields._wafflesType == true then
+		definition = definitionOrFields
+	else
+		definition = Types.Struct(definitionOrFields)
+	end
+	return table.freeze(setmetatable({
+		Definition = definition,
+		Hash = hashDefinition(definition),
+	}, SchemaMethods)) :: any
+end
+
+local function sameDefinition(a: TypeDefinition, b: TypeDefinition): boolean
+	return descriptorText(a) == descriptorText(b)
+end
+
+local function infer(value: any, depth: number, active: {[any]: boolean}): TypeDefinition
+	if depth > 64 then error("[Waffles] SmartSchema example exceeds maximum nesting depth", 3) end
+	local kind = typeof(value)
+	if value == nil then return Types.Optional(Types.Any) end
+	if kind == "boolean" then return Types.Boolean end
+	if kind == "string" then return Types.String end
+	if kind == "number" then return if value % 1 == 0 and math.abs(value) <= 4503599627370495 and not (value == 0 and 1 / value == -math.huge) then Types.Integer else Types.Number end
+	if kind == "buffer" then return Types.Buffer end
+	if kind ~= "table" then
+		local known = Types[kind]
+		if known then return known end
+		return Types.Any
+	end
+	if active[value] then error("[Waffles] SmartSchema cannot infer a cyclic table", 3) end
+	active[value] = true
+	local count, max, allIndices, allStrings = 0, 0, true, true
+	for key in value do
+		count += 1
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then allIndices = false else max = math.max(max, key) end
+		if type(key) ~= "string" then allStrings = false end
+	end
+	local result: TypeDefinition
+	if allIndices and max == count then
+		local element = Types.Any
+		if count > 0 then
+			element = infer(value[1], depth + 1, active)
+			for index = 2, count do
+				local nextDefinition = infer(value[index], depth + 1, active)
+				if not sameDefinition(element, nextDefinition) then element = Types.Any; break end
+			end
+		end
+		result = Types.Array(element)
+	elseif allStrings then
+		local fields = {}
+		for key, item in value do fields[key] = infer(item, depth + 1, active) end
+		result = Types.Struct(fields)
+	else
+		local keyDefinition: TypeDefinition? = nil
+		local valueDefinition: TypeDefinition? = nil
+		for key, item in value do
+			local inferredKey = infer(key, depth + 1, active)
+			local inferredValue = infer(item, depth + 1, active)
+			if keyDefinition == nil then keyDefinition = inferredKey elseif not sameDefinition(keyDefinition, inferredKey) then keyDefinition = Types.Any end
+			if valueDefinition == nil then valueDefinition = inferredValue elseif not sameDefinition(valueDefinition, inferredValue) then valueDefinition = Types.Any end
+		end
+		local finalKey = keyDefinition or Types.Any
+		if finalKey.kind == "boolean" or finalKey.kind == "string" or finalKey.kind == "number" or finalKey.kind == "integer" or finalKey.kind == "enum" then
+			result = Types.Map(finalKey, valueDefinition or Types.Any)
+		else
+			result = Types.Any
+		end
+	end
+	active[value] = nil
+	return result
+end
+
+function SchemaModule.smart(example: any): SchemaObject
+	return SchemaModule.create(infer(example, 0, {}))
+end
+
+function SchemaModule.setRuntime(value: Runtime)
+	runtime = value
+end
+
+function SchemaModule.writeDefinition(definition: TypeDefinition, writer: any, value: any, autoContext: any)
+	write(definition, writer, value, autoContext, 0)
+end
+
+function SchemaModule.readDefinition(definition: TypeDefinition, reader: any, autoContext: any): any
+	return read(definition, reader, autoContext, 0)
+end
+
+SchemaModule.Types = table.freeze(Types)
+
+return SchemaModule
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">Tags</string>
+            <string name="Source"><![CDATA[--!strict
+
+-- The Waffles v1 automatic wire tags. Values are permanent once published.
+return table.freeze({
+	Nil = 0,
+	False = 1,
+	True = 2,
+	Integer = 3,
+	Float32 = 4,
+	Float64 = 5,
+	String = 6,
+	StringReference = 7,
+	Buffer = 8,
+	BufferRle = 9,
+	Array = 10,
+	Map = 11,
+	LayoutDefinition = 12,
+	LayoutReference = 13,
+	CommonKey = 14,
+
+	Vector2 = 20,
+	Vector3 = 21,
+	Vector2int16 = 22,
+	Vector3int16 = 23,
+	CFrame = 24,
+	Color3 = 25,
+	BrickColor = 26,
+	UDim = 27,
+	UDim2 = 28,
+	Rect = 29,
+	Ray = 30,
+	NumberRange = 31,
+	NumberSequence = 32,
+	NumberSequenceKeypoint = 33,
+	ColorSequence = 34,
+	ColorSequenceKeypoint = 35,
+	DateTime = 36,
+	Font = 37,
+	EnumItem = 38,
+
+	Custom = 60,
+})
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">Writer</string>
+            <string name="Source"><![CDATA[--!strict
+
+local MAX_SAFE_INTEGER = 9007199254740991
+local MIN_CAPACITY = 64
+
+export type Writer = {
+	_data: buffer,
+	_cursor: number,
+	_bucket: number,
+	_maxCapacity: number,
+	WriteU8: (self: Writer, value: number) -> (),
+	WriteU16: (self: Writer, value: number) -> (),
+	WriteU32: (self: Writer, value: number) -> (),
+	WriteI16: (self: Writer, value: number) -> (),
+	WriteI32: (self: Writer, value: number) -> (),
+	WriteF32: (self: Writer, value: number) -> (),
+	WriteF64: (self: Writer, value: number) -> (),
+	WriteVarUInt: (self: Writer, value: number) -> (),
+	WriteVarInt: (self: Writer, value: number) -> (),
+	WriteString: (self: Writer, value: string) -> (),
+	WriteRawString: (self: Writer, value: string) -> (),
+	WriteBuffer: (self: Writer, value: buffer) -> (),
+	WriteRawBuffer: (self: Writer, value: buffer) -> (),
+	Position: (self: Writer) -> number,
+	Finish: (self: Writer) -> buffer,
+}
+
+local WriterMethods = {}
+WriterMethods.__index = WriterMethods
+
+local function nextPowerOfTwo(value: number): number
+	local capacity = MIN_CAPACITY
+	while capacity < value do
+		capacity *= 2
+	end
+	return capacity
+end
+
+local function ensure(self: Writer, byteCount: number)
+	local required = self._cursor + byteCount
+	if required > self._maxCapacity then
+		error(string.format("[Waffles] Encoded payload exceeds limit %d", self._maxCapacity), 3)
+	end
+	local current = buffer.len(self._data)
+	if required <= current then
+		return
+	end
+	local capacity = nextPowerOfTwo(required)
+	local grown = buffer.create(capacity)
+	buffer.copy(grown, 0, self._data, 0, self._cursor)
+	self._data = grown
+	self._bucket = capacity
+end
+
+function WriterMethods.WriteU8(self: Writer, value: number)
+	ensure(self, 1)
+	buffer.writeu8(self._data, self._cursor, value)
+	self._cursor += 1
+end
+
+function WriterMethods.WriteU16(self: Writer, value: number)
+	ensure(self, 2)
+	buffer.writeu16(self._data, self._cursor, value)
+	self._cursor += 2
+end
+
+function WriterMethods.WriteU32(self: Writer, value: number)
+	ensure(self, 4)
+	buffer.writeu32(self._data, self._cursor, value)
+	self._cursor += 4
+end
+
+function WriterMethods.WriteI16(self: Writer, value: number)
+	ensure(self, 2)
+	buffer.writei16(self._data, self._cursor, value)
+	self._cursor += 2
+end
+
+function WriterMethods.WriteI32(self: Writer, value: number)
+	ensure(self, 4)
+	buffer.writei32(self._data, self._cursor, value)
+	self._cursor += 4
+end
+
+function WriterMethods.WriteF32(self: Writer, value: number)
+	ensure(self, 4)
+	buffer.writef32(self._data, self._cursor, value)
+	self._cursor += 4
+end
+
+function WriterMethods.WriteF64(self: Writer, value: number)
+	ensure(self, 8)
+	buffer.writef64(self._data, self._cursor, value)
+	self._cursor += 8
+end
+
+function WriterMethods.WriteVarUInt(self: Writer, value: number)
+	if value < 0 or value > MAX_SAFE_INTEGER or value % 1 ~= 0 then
+		error("[Waffles] VarUInt value must be a non-negative safe integer", 2)
+	end
+	repeat
+		local byte = value % 128
+		value = math.floor(value / 128)
+		if value ~= 0 then
+			byte += 128
+		end
+		self:WriteU8(byte)
+	until value == 0
+end
+
+function WriterMethods.WriteVarInt(self: Writer, value: number)
+	if value % 1 ~= 0 or math.abs(value) > 4503599627370495 then
+		error("[Waffles] VarInt value is outside the supported safe range", 2)
+	end
+	local zigzag = if value >= 0 then value * 2 else -value * 2 - 1
+	self:WriteVarUInt(zigzag)
+end
+
+function WriterMethods.WriteRawString(self: Writer, value: string)
+	local length = #value
+	ensure(self, length)
+	buffer.writestring(self._data, self._cursor, value)
+	self._cursor += length
+end
+
+function WriterMethods.WriteString(self: Writer, value: string)
+	self:WriteVarUInt(#value)
+	self:WriteRawString(value)
+end
+
+function WriterMethods.WriteRawBuffer(self: Writer, value: buffer)
+	local length = buffer.len(value)
+	ensure(self, length)
+	buffer.copy(self._data, self._cursor, value, 0, length)
+	self._cursor += length
+end
+
+function WriterMethods.WriteBuffer(self: Writer, value: buffer)
+	self:WriteVarUInt(buffer.len(value))
+	self:WriteRawBuffer(value)
+end
+
+function WriterMethods.Position(self: Writer): number
+	return self._cursor
+end
+
+function WriterMethods.Finish(self: Writer): buffer
+	local result = buffer.create(self._cursor)
+	if self._cursor > 0 then
+		buffer.copy(result, 0, self._data, 0, self._cursor)
+	end
+	return result
+end
+
+local pools: {[number]: {Writer}} = {}
+
+local WriterModule = {}
+
+function WriterModule.acquire(initialSize: number, poolingEnabled: boolean, maxCapacity: number): Writer
+	local bucket = nextPowerOfTwo(math.max(initialSize, MIN_CAPACITY))
+	if poolingEnabled then
+		local pool = pools[bucket]
+		if pool and #pool > 0 then
+			local writer = table.remove(pool) :: Writer
+			writer._cursor = 0
+			writer._maxCapacity = maxCapacity
+			return writer
+		end
+	end
+	return setmetatable({
+		_data = buffer.create(bucket),
+		_cursor = 0,
+		_bucket = bucket,
+		_maxCapacity = maxCapacity,
+	}, WriterMethods) :: any
+end
+
+function WriterModule.release(writer: Writer, poolingEnabled: boolean, maxPerBucket: number, maxPooledSize: number)
+	if not poolingEnabled or writer._bucket > maxPooledSize then
+		return
+	end
+	if writer._cursor > 0 then
+		buffer.fill(writer._data, 0, 0, writer._cursor)
+	end
+	writer._cursor = 0
+	local bucket = writer._bucket
+	local pool = pools[bucket]
+	if not pool then
+		pool = {}
+		pools[bucket] = pool
+	end
+	if #pool < maxPerBucket then
+		table.insert(pool, writer)
+	end
+end
+
+return WriterModule
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">Settings</string>
+          <string name="Source"><![CDATA[--!strict
+
+-- Waffles defaults. A fresh copy is created by init.luau so this table is never
+-- mutated by consumers that happen to require Settings directly.
+return table.freeze({
+	poolingEnabled = true,
+	writerPoolMaxPerBucket = 8,
+	maxPooledWriterSize = 1024 * 1024,
+	readerPoolMax = 16,
+	initialWriterSize = 256,
+
+	rleThreshold = 0.15,
+	sortedKeysCacheEnabled = true,
+	sortedKeysCacheTrustMode = false,
+	commonKeys = table.freeze({}),
+	stringCacheMinLength = 16,
+
+	schemaValidationEnabled = true,
+	strictBoundsChecking = true,
+	maxDepth = 64,
+	maxCollectionCount = 100000,
+	maxStringBytes = 8 * 1024 * 1024,
+	maxBufferBytes = 16 * 1024 * 1024,
+	maxPayloadBytes = 32 * 1024 * 1024,
+	maxVarintBytes = 8,
+
+	debugAsserts = false,
+})
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+</roblox>

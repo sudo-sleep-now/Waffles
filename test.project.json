@@ -1,0 +1,24 @@
+{
+  "name": "WafflesTests",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Waffles": {
+        "$path": "src"
+      }
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "WafflesTests": {
+        "$path": "tests/TestRunner.server.luau"
+      },
+      "WafflesBenchmarks": {
+        "$path": "benchmarks/Benchmark.server.luau",
+        "$properties": {
+          "Disabled": true
+        }
+      }
+    }
+  }
+}

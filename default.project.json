@@ -1,0 +1,12 @@
+{
+  "name": "Waffles",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Waffles": {
+        "$path": "src"
+      }
+    }
+  }
+}
