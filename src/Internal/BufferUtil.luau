@@ -39,12 +39,7 @@ function BufferUtil.Equals(a: buffer, b: buffer): boolean
 	if length ~= buffer.len(b) then
 		return false
 	end
-	for index = 0, length - 1 do
-		if buffer.readu8(a, index) ~= buffer.readu8(b, index) then
-			return false
-		end
-	end
-	return true
+	return buffer.tostring(a) == buffer.tostring(b)
 end
 
 local HEX = "0123456789abcdef"

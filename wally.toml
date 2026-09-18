@@ -1,5 +1,5 @@
 [package]
-name = "placeholder/waffles"
+name = "fouroeight/waffles"
 description = "High-performance, safe binary serialization for Roblox"
 version = "1.0.0"
 license = "MIT"

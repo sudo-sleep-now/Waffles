@@ -89,6 +89,48 @@ test("repeated strings layouts and RLE", function()
 	roundTrip({{name = repeated, score = 1}, {name = repeated, score = 2}, raw = compressed})
 end)
 
+test("compact records preserve negative zero", function()
+	local negativeZero = -1 / math.huge
+	local decoded = Waffles.DeserializeAuto(Waffles.SerializeAuto({
+		{value = negativeZero},
+		{value = negativeZero},
+	}))
+	expect(1 / decoded[1].value == -math.huge and 1 / decoded[2].value == -math.huge, "compact record lost negative zero")
+end)
+
+test("compact string limits apply to cached plans", function()
+	local value = {
+		{label = "long"},
+		{label = "long"},
+	}
+	Waffles.SerializeAuto(value)
+	Waffles.Configure({maxStringBytes = 3})
+	expectError(function() Waffles.SerializeAuto(value) end, "length")
+	Waffles.Configure({maxStringBytes = 8 * 1024 * 1024})
+end)
+
+test("compact record allocation limits", function()
+	local value = {
+		{first = 1, second = 2},
+		{first = 3, second = 4},
+	}
+	local encoded = Waffles.SerializeAuto(value)
+	Waffles.Configure({maxRecordCells = 3})
+	expectError(function() Waffles.DeserializeAuto(encoded) end, "cells")
+	Waffles.Configure({maxRecordCells = 8000000})
+end)
+
+test("compact record field limits", function()
+	local value = {
+		{first = 1, second = 2},
+		{first = 3, second = 4},
+	}
+	local encoded = Waffles.SerializeAuto(value)
+	Waffles.Configure({maxRecordFields = 1})
+	expectError(function() Waffles.DeserializeAuto(encoded) end, "field count")
+	Waffles.Configure({maxRecordFields = 1024})
+end)
+
 test("Roblox datatypes", function()
 	local values = {
 		Vector2.new(1.25, -2.5),
@@ -145,10 +187,79 @@ test("explicit schemas", function()
 	end, "inventory[1].id")
 end)
 
+test("struct definitions snapshot caller fields", function()
+	local fields = {value = Waffles.Types.Integer}
+	local definition = Waffles.Types.Struct(fields)
+	fields.value = Waffles.Types.String
+	local schema = Waffles.Schema(definition)
+	local decoded = schema:Deserialize(schema:Serialize({value = 7}))
+	expect(decoded.value == 7, "struct changed after caller mutation")
+end)
+
+test("schema compact record limits and truncation", function()
+	local schema = Waffles.Schema(Waffles.Types.Array(Waffles.Types.Struct({
+		id = Waffles.Types.Integer,
+		label = Waffles.Types.String,
+	})))
+	local value = {{id = 1, label = "a"}, {id = 2, label = "b"}}
+	local encoded = schema:Serialize(value)
+	Waffles.Configure({maxRecordCells = 3})
+	expectError(function() schema:Deserialize(encoded) end, "cells")
+	Waffles.Configure({maxRecordCells = 8000000})
+	Waffles.Configure({maxRecordFields = 1})
+	expectError(function() schema:Deserialize(encoded) end, "field count")
+	Waffles.Configure({maxRecordFields = 1024})
+	for length = 0, buffer.len(encoded) - 1 do
+		expectError(function() schema:Deserialize(Waffles.Buffer.Slice(encoded, 0, length)) end)
+	end
+end)
+
+test("legacy A5 schema record arrays remain readable", function()
+	local schema = Waffles.Schema(Waffles.Types.Array(Waffles.Types.Struct({
+		id = Waffles.Types.Integer,
+		payload = Waffles.Types.Buffer,
+		note = Waffles.Types.Optional(Waffles.Types.String),
+	})))
+	local value = {
+		{id = 1, payload = buffer.fromstring("a")},
+		{id = 2, payload = buffer.fromstring("b"), note = "kept"},
+	}
+	expect(equivalent(value, schema:Deserialize(schema:Serialize(value))))
+end)
+
+test("A6 schema strings use compact framing", function()
+	local schema = Waffles.Schema(Waffles.Types.Array(Waffles.Types.Struct({
+		label = Waffles.Types.String,
+	})))
+	local repeated = string.rep("x", 300)
+	local value = {{label = repeated}, {label = repeated}}
+	expect(equivalent(value, schema:Deserialize(schema:Serialize(value))))
+end)
+
 test("smart schemas", function()
 	local value = {userId = 1234, username = "Player", active = true, scores = {1, 2, 3}}
 	local schema = Waffles.SmartSchema(value)
 	expect(equivalent(value, schema:Deserialize(schema:Serialize(value))))
+end)
+
+test("decode cache admits on the second hit", function()
+	local value = {items = {{id = "a"}, {id = "b"}}}
+	local schema = Waffles.Schema({items = Waffles.Types.Array(Waffles.Types.Struct({id = Waffles.Types.String}))})
+	local autoData = Waffles.SerializeAuto(value)
+	local schemaData = schema:Serialize(value)
+	local firstAuto = Waffles.DeserializeAuto(autoData)
+	local firstSchema = schema:Deserialize(schemaData)
+	firstAuto.items[1].id = "direct-mutation"
+	firstSchema.items[1].id = "direct-mutation"
+	local secondAuto = Waffles.DeserializeAuto(autoData)
+	local secondSchema = schema:Deserialize(schemaData)
+	secondAuto.items[1].id = "promotion-mutation"
+	secondSchema.items[1].id = "promotion-mutation"
+	local thirdAuto = Waffles.DeserializeAuto(autoData)
+	local thirdSchema = schema:Deserialize(schemaData)
+	expect(thirdAuto.items[1].id == "a" and thirdSchema.items[1].id == "a", "promoted snapshots must clone results")
+	buffer.writeu8(autoData, 0, 0)
+	expectError(function() Waffles.DeserializeAuto(autoData) end, "header")
 end)
 
 test("custom converters", function()
@@ -166,8 +277,11 @@ test("custom converters", function()
 			return {_marker = marker, x = reader:ReadVarInt("x"), y = reader:ReadVarInt("y")}
 		end,
 	})
-	local decoded = roundTrip({_marker = marker, x = -7, y = 9})
-	expect(decoded.x == -7 and decoded.y == 9)
+	local encoded = Waffles.SerializeAuto({_marker = marker, x = -7, y = 9})
+	local decoded = Waffles.DeserializeAuto(encoded)
+	decoded.x = 99
+	local decodedAgain = Waffles.DeserializeAuto(encoded)
+	expect(decodedAgain.x == -7 and decodedAgain.y == 9, "converter payload should bypass decode snapshots")
 end)
 
 test("batch including nil slots", function()
@@ -180,6 +294,38 @@ test("deterministic map ordering", function()
 	local a = {}; a.z = 1; a.a = 2; a.m = 3
 	local b = {}; b.m = 3; b.z = 1; b.a = 2
 	expect(Waffles.Buffer.Equals(Waffles.SerializeAuto(a), Waffles.SerializeAuto(b)))
+end)
+
+test("warm snapshot caches stay isolated", function()
+	expect(Waffles.GetConfiguration().decodeSnapshotCacheEnabled == true, "decode snapshot cache should default to enabled")
+	local value = {coins = 1250, items = {{uid = "item-a", id = "Honey", amount = 12}, {uid = "item-b", id = "Wax", amount = 4, nickname = "Keep"}}}
+	local schema = Waffles.Schema({
+		coins = Waffles.Types.Integer,
+		items = Waffles.Types.Array(Waffles.Types.Struct({
+			uid = Waffles.Types.String,
+			id = Waffles.Types.String,
+			amount = Waffles.Types.Integer,
+			nickname = Waffles.Types.Optional(Waffles.Types.String),
+		})),
+	})
+	local autoData = Waffles.SerializeAuto(value)
+	local schemaData = schema:Serialize(value)
+	local autoDecoded = Waffles.DeserializeAuto(autoData)
+	local schemaDecoded = schema:Deserialize(schemaData)
+	autoDecoded.items[1].id = "changed"
+	schemaDecoded.items[1].id = "changed"
+	-- The first two decodes are direct. Promotion happens only after the
+	-- second unchanged identity, so mutating either direct result must not
+	-- affect the third (clone-isolated) decode.
+	local autoPromoted = Waffles.DeserializeAuto(autoData)
+	local schemaPromoted = schema:Deserialize(schemaData)
+	autoPromoted.items[1].id = "changed-again"
+	schemaPromoted.items[1].id = "changed-again"
+	expect(Waffles.DeserializeAuto(autoData).items[1].id == "Honey")
+	expect(schema:Deserialize(schemaData).items[1].id == "Honey")
+	buffer.writeu8(autoData, 0, 0)
+	expectError(function() Waffles.DeserializeAuto(autoData) end)
+	expect(not Waffles.Buffer.Equals(Waffles.SerializeAuto(value), autoData))
 end)
 
 test("configuration and common-key fingerprint", function()

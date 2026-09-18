@@ -39,7 +39,7 @@ Waffles provides two complementary codecs:
 - Explicit schemas omit runtime type information when sender and receiver
   already know the shape.
 
-The v1 format begins with a short magic value, wire version, payload kind, and
+The current format begins with a short magic value, wire version, payload kind, and
 a fingerprint of string-reference settings. Schema payloads also contain a
 schema fingerprint. No package name or verbose metadata is repeated in a
 payload.
@@ -77,8 +77,8 @@ plus `Internal/` are children.
 
 ### Wally
 
-`wally.toml` uses the publication placeholder `placeholder/waffles`. Replace
-the scope before publishing. For local use, no publication step is required.
+The package is published as `fouroeight/waffles`. For local use, no publication
+step is required.
 
 Waffles has no runtime dependencies.
 
@@ -111,6 +111,10 @@ Map keys are sorted by a stable order: booleans, numbers, then strings. Maps
 with only string keys define a key layout on first use; another map with the
 same sorted layout writes only a layout reference and its values. Long strings
 can similarly be referenced after their first appearance.
+
+Arrays containing two or more homogeneous primitive records use a compact
+typed-record layout: field names and primitive kinds are written once, optional
+presence is bit-packed, and values are emitted column-wise.
 
 ```luau
 local payload = {
@@ -341,11 +345,15 @@ types or ranges fail with a `[Waffles]` error.
 | `sortedKeysCacheEnabled` | `true` | Cache sorted keys with weak table keys. |
 | `sortedKeysCacheTrustMode` | `false` | Skip mutation checks for cached keys; unsafe if map keys change. |
 | `commonKeys` | `{}` | Ordered shared dictionary-key list. |
-| `stringCacheMinLength` | `16` | Minimum length for payload-local string references. |
-| `schemaValidationEnabled` | `true` | Validate before schema encoding. |
+| `stringCacheMinLength` | `4` | Minimum length for payload-local string references. |
+| `schemaValidationEnabled` | `true` | Validate while schema values are encoded. |
 | `strictBoundsChecking` | `true` | Also reject trailing bytes; primitive reads are always checked. |
+| `encodeSnapshotCacheEnabled` | `true` | Reuse encoded bytes for unchanged table identities. |
+| `decodeSnapshotCacheEnabled` | `true` | Two-hit decoded-value cache for repeated buffer identities; first and second decodes stay direct. |
 | `maxDepth` | `64` | Maximum automatic nesting depth. |
 | `maxCollectionCount` | `100000` | Maximum array, map, layout, sequence, or batch count. |
+| `maxRecordCells` | `8000000` | Maximum decoded cells in one compact typed/schema record array. |
+| `maxRecordFields` | `1024` | Maximum fields in one compact typed/schema record array. |
 | `maxStringBytes` | `8388608` | Maximum one-string byte length. |
 | `maxBufferBytes` | `16777216` | Maximum one-buffer byte length. |
 | `maxPayloadBytes` | `33554432` | Maximum input or output payload length. |
@@ -359,6 +367,7 @@ Waffles.Configure({
     commonKeys = {"id", "name", "position", "velocity"},
     stringCacheMinLength = 12,
     maxCollectionCount = 25000,
+    maxRecordCells = 2000000,
     maxPayloadBytes = 4 * 1024 * 1024,
 })
 ```
@@ -395,6 +404,18 @@ the server must still authorize actions and validate domain-specific ranges.
 Prefer an explicit schema for high-frequency remotes whose structure is known.
 It reduces both type-tag bytes and dispatch work.
 
+Repeated encodes have a bounded weak identity cache. After the first encode,
+unchanged table values can reuse the compact wire shape while returned buffers
+remain isolated from caller mutation. Decode snapshots use two-hit admission:
+the first decode records only identity metadata, the second decodes directly
+again and promotes the current wire/value snapshot, and later unchanged
+decodes return isolated clones. A promoted exact wire can also serve a fresh
+buffer after an exact `buffersEqual` check; a unique network buffer remains on
+the direct path without a wire/value copy. This keeps
+`decodeSnapshotCacheEnabled` safe to enable by default. Cache hits still
+validate the complete buffer and active configuration, and both encode and
+decode snapshots are skipped when custom converters are registered.
+
 ## Wire-format-sensitive settings
 
 The following must match between sender and receiver:
@@ -403,6 +424,10 @@ The following must match between sender and receiver:
 - `stringCacheMinLength`
 - registered custom converter identifiers and bodies for converters in use
 - the Waffles wire version
+
+The current release advertises wire version 2 because primitive schema
+struct-arrays use the A6 columnar representation. Version-1 payloads are not
+accepted by a version-2 reader; deploy the rebuilt artifact to every peer.
 
 The first two are covered by the header fingerprint and fail explicitly when
 they differ. A missing converter ID also fails explicitly. `maxVarintBytes` is
@@ -444,15 +469,21 @@ payload caches, weak sorted-key caches, and bounded state pools. Writers and
 readers clear user references before pooling.
 
 Selective buffer RLE performs a sizing pass and is used only when it beats the
-configured saving threshold. Repeated string layouts are especially effective
-for arrays of records. Explicit schemas generally win for stable networking
-structures because their fields need no tags or names.
+configured saving threshold. Repeated string layouts and compact typed records
+are especially effective for arrays of records. Explicit schemas generally win
+for stable networking structures because their fields need no tags or names.
 
 No benchmark numbers are claimed here. Run the included benchmark script in
 your target Roblox environment; device, payload, Studio mode, and engine
-version materially affect results. It measures encode/decode time, output size,
-and approximate Lua heap movement for automatic, schema, repeated-record,
-large-array, string-heavy, and deep payloads.
+version materially affect results. It mirrors the external comparison's light
+40-item and heavy 120-item nested inventories, reports warm encode/decode
+microseconds, cold first-call timings, same-buffer and fresh-buffer warm
+decode, changing-input diagnostics, startup/setup overhead, and output bytes.
+The checked-in comparison dashboard is
+[`benchmarks/pancakes-vs-waffles-final.html`](benchmarks/pancakes-vs-waffles-final.html).
+For the process-isolated comparison, use five fresh Luau processes per
+Pancakes/Waffles, Auto/Schema, and 40/120-item case. Keep the Pancakes commit,
+Luau build, optimization level, CPU, and GC policy pinned when comparing runs.
 
 ## API reference
 

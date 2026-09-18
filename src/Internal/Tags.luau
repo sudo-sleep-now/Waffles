@@ -1,6 +1,7 @@
 --!strict
 
--- The Waffles v1 automatic wire tags. Values are permanent once published.
+-- The Waffles automatic wire tags. Values are permanent once published;
+-- payload framing/versioning is enforced by init.luau.
 return table.freeze({
 	Nil = 0,
 	False = 1,
@@ -17,6 +18,9 @@ return table.freeze({
 	LayoutDefinition = 12,
 	LayoutReference = 13,
 	CommonKey = 14,
+	-- Compact homogeneous record arrays carry their field plan once, then
+	-- encode each column without per-value automatic tags.
+	TypedRecordArray = 15,
 
 	Vector2 = 20,
 	Vector3 = 21,
