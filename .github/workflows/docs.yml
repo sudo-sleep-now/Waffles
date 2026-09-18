@@ -3,7 +3,9 @@ name: Docs
 on:
   push:
     branches: [main]
-    paths: ['docs/**', '.github/workflows/docs.yml']
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -14,9 +16,6 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: false
-
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
 jobs:
   build:
@@ -33,7 +32,7 @@ jobs:
           cache-dependency-path: docs/package-lock.json
       - run: npm ci
       - run: npm run docs:build
-      - run: touch .vitepress/dist/.nojekyll # Pages serves raw files, skips Jekyll
+      - run: touch .vitepress/dist/.nojekyll
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/.vitepress/dist
