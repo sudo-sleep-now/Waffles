@@ -17,5 +17,3 @@ Waffles (mine) beats Pancakes (direct competitor) in **every measured case** —
 ## Reproduce it
 
 No benchmark numbers should be taken on faith — run the included benchmark script in your target Roblox environment. Device, payload, Studio mode, and engine version materially affect results. It mirrors the external comparison's light 40-item and heavy 120-item nested inventories and reports warm encode/decode microseconds, cold first-call timings, same-buffer and fresh-buffer warm decode, changing-input diagnostics, startup/setup overhead, and output bytes.
-
-The checked-in comparison dashboard is [`benchmarks/pancakes-vs-waffles-final.html`](https://github.com/). For the process-isolated comparison, use five fresh Luau processes per Pancakes/Waffles, Auto/Schema, and 40/120-item case. Keep the Pancakes commit, Luau build, optimization level, CPU, and GC policy pinned when comparing runs.
