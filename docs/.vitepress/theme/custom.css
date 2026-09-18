@@ -1,0 +1,205 @@
+/* Waffles — dark brownish minimalist theme (VitePress overrides) */
+
+:root,
+.dark {
+  --vp-c-bg: #14100b;
+  --vp-c-bg-alt: #1b140d;
+  --vp-c-bg-elv: #201812;
+  --vp-c-bg-soft: #231a12;
+
+  --vp-c-border: #342719;
+  --vp-c-divider: #2c2317;
+  --vp-c-gutter: #2c2317;
+
+  --vp-c-text-1: #f1e7d6;
+  --vp-c-text-2: #c9bb9f;
+  --vp-c-text-3: #8a7a63;
+
+  --vp-c-brand-1: #e8b04b;
+  --vp-c-brand-2: #d99f35;
+  --vp-c-brand-3: #b9822a;
+  --vp-c-brand-soft: rgba(232, 176, 75, 0.14);
+
+  --vp-code-block-bg: #120d08;
+  --vp-code-line-highlight-color: rgba(232, 176, 75, 0.08);
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #f5d9a0 10%, #e8b04b 55%, #c97b3d 100%);
+  --vp-home-hero-image-background-image: radial-gradient(circle, rgba(232, 176, 75, 0.25), transparent 65%);
+  --vp-home-hero-image-filter: blur(56px);
+
+  --vp-button-brand-bg: #e8b04b;
+  --vp-button-brand-text: #1d1407;
+  --vp-button-brand-hover-bg: #f0bd5e;
+  --vp-button-brand-active-bg: #d99f35;
+
+  --vp-custom-block-tip-bg: #211a10;
+  --vp-custom-block-tip-border: #44341f;
+}
+
+html,
+body {
+  background: var(--vp-c-bg);
+}
+
+.VPNavBar,
+.VPNav {
+  background: rgba(20, 16, 11, 0.92) !important;
+}
+
+.VPSidebar {
+  background: #1b140d !important;
+}
+
+/* Code */
+.vp-doc :not(pre) > code {
+  background: #2b2115;
+  border: 1px solid #342719;
+  color: #f5d9a0;
+}
+
+.vp-doc div[class*='language-'] {
+  border: 1px solid #342719;
+}
+
+/* Tables */
+.vp-doc table {
+  background: #201812;
+}
+.vp-doc th {
+  color: #8a7a63;
+  text-transform: uppercase;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+}
+
+/* Custom blocks blend with theme */
+.vp-doc .custom-block {
+  border-radius: 10px;
+}
+
+/* Benchmark dashboard */
+.bench-wrap {
+  border: 1px solid var(--vp-c-border);
+  border-radius: 18px;
+  background: #1b140d;
+  padding: 20px;
+  margin: 20px 0;
+}
+.bench-sub {
+  color: var(--vp-c-text-2);
+  font-size: 13px;
+  margin: 4px 0 2px;
+}
+.bench-legend {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--vp-c-text-2);
+  margin: 10px 0 6px;
+}
+.bench-filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 16px;
+}
+.bench-filters button {
+  font-size: 12.5px;
+  font-weight: 650;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--vp-c-border);
+  background: transparent;
+  color: var(--vp-c-text-2);
+  cursor: pointer;
+}
+.bench-filters button.on {
+  background: rgba(232, 176, 75, 0.16);
+  border-color: #6b5326;
+  color: #e8b04b;
+}
+.bench-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+@media (max-width: 960px) {
+  .bench-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.bench-card {
+  background: #1e1610;
+  border: 1px solid var(--vp-c-border);
+  border-radius: 14px;
+  padding: 14px 14px 8px;
+}
+.bench-card h4 {
+  margin: 0 0 6px;
+  font-size: 14.5px;
+}
+.bench-row {
+  padding: 9px 0;
+  border-top: 1px solid #2c2317;
+}
+.bench-row:first-of-type {
+  border-top: none;
+}
+.bench-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12.5px;
+}
+.bench-top .lbl {
+  color: var(--vp-c-text-2);
+}
+.bench-top .adv {
+  color: #9ed6a3;
+  font-weight: 750;
+  font-size: 11.8px;
+  white-space: nowrap;
+}
+.bar-line {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0;
+}
+.btag {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #171006;
+}
+.btag.w { background: #e8b04b; }
+.btag.p { background: #d38a67; }
+.track {
+  height: 8px;
+  background: #2e2418;
+  border-radius: 99px;
+  overflow: hidden;
+}
+.fill { height: 100%; border-radius: 99px; }
+.fill.w { background: #e8b04b; }
+.fill.p { background: #d38a67; }
+.bval {
+  font-family: var(--vp-font-family-mono);
+  font-size: 12.5px;
+  min-width: 76px;
+  text-align: right;
+}
+.bval.w { color: #e8b04b; font-weight: 700; }
+.bval.p { color: #d8c0ad; }
+.bench-note {
+  font-size: 12.5px;
+  color: var(--vp-c-text-3);
+  margin: 12px 2px 0;
+}
